@@ -248,6 +248,95 @@ async def archive_version(repo,version,info):
     else: c.execute("UPDATE versions SET status='queued',updated_at=? WHERE id=?",(now(),version["id"]))
     c.commit(); c.close(); queue_event.set()
 
+async def list_user_repos(username):
+    username=username.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9-]+",username):
+        raise ValueError("Invalid GitHub username")
+    repos=[]
+    async with httpx.AsyncClient(timeout=45) as client:
+        page=1
+        while True:
+            items=await gh_json(client,f"https://api.github.com/users/{quote(username,safe='')}/repos?per_page=100&page={page}&type=owner")
+            if not items: break
+            repos.extend(items)
+            if len(items)<100: break
+            page+=1
+    return repos
+
+async def list_repo_releases(full_name, include_prereleases=True):
+    releases=[]
+    async with httpx.AsyncClient(timeout=60) as client:
+        page=1
+        while True:
+            items=await gh_json(client,f"https://api.github.com/repos/{full_name}/releases?per_page=100&page={page}")
+            if not items: break
+            for rel in items:
+                if rel.get("draft"): continue
+                if rel.get("prerelease") and not include_prereleases: continue
+                releases.append({
+                    "version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release",
+                    "published_at":rel.get("published_at") or rel.get("created_at"),
+                    "html_url":rel["html_url"],"sha":None,"assets":rel.get("assets",[])
+                })
+            if len(items)<100: break
+            page+=1
+    return releases
+
+async def import_repo_history(repo_id):
+    c=db(); repo=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
+    if not repo: return
+    try:
+        meta,_=await discover(repo["full_name"],{"prereleases":True})
+        releases=await list_repo_releases(repo["full_name"],True)
+        c=db()
+        c.execute("UPDATE repos SET name=?,default_branch=?,status='importing',error=NULL,updated_at=? WHERE id=?",
+                  (meta["name"],meta["default_branch"],now(),repo_id)); c.commit()
+        repo_now=dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone())
+        c.close()
+        for info in reversed(releases):
+            info["default_branch"]=meta["default_branch"]
+            c=db(); v=upsert_version(c,repo_now,info); c.commit(); known=c.execute(
+                "SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone(); c.close()
+            if known["status"]!="complete":
+                await create_manifest(repo_now,known,info)
+        c=db()
+        c.execute("UPDATE repos SET status='queued',latest_version=?,latest_kind='release',latest_date=?,latest_url=?,last_checked_at=?,updated_at=? WHERE id=?",
+                  ((releases[-1]["version"] if releases else None),
+                   (releases[-1]["published_at"] if releases else None),
+                   (releases[-1]["html_url"] if releases else None),now(),now(),repo_id))
+        c.commit(); c.close(); queue_event.set()
+        if not releases:
+            await check_repo(repo_id)
+    except Exception as e:
+        c=db(); c.execute("UPDATE repos SET status='failed',error=?,updated_at=? WHERE id=?",(str(e)[:4000],now(),repo_id)); c.commit(); c.close()
+
+async def import_user(username, archive_all=True):
+    try:
+        items=await list_user_repos(username)
+    except Exception:
+        raise
+    results=[]
+    for item in items:
+        full=item.get("full_name")
+        if not full: continue
+        c=db(); existing=c.execute("SELECT id FROM repos WHERE full_name=?",(full,)).fetchone()
+        if existing:
+            rid=existing["id"]
+        else:
+            t=now()
+            c.execute("INSERT INTO repos(full_name,url,name,default_branch,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                      (full,f"https://github.com/{full}",item.get("name") or full.split("/",1)[1],
+                       item.get("default_branch"),"never",t,t))
+            rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            c.commit()
+        c.close()
+        if archive_all:
+            asyncio.create_task(import_repo_history(rid))
+        else:
+            asyncio.create_task(check_repo(rid))
+        results.append({"id":rid,"full_name":full})
+    return results
+
 async def check_repo(repo_id):
     async with check_lock:
         c=db(); repo=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
@@ -300,7 +389,8 @@ async def scheduler():
         except Exception: pass
         await asyncio.sleep(60)
 
-class RepoIn(BaseModel): url:str
+class RepoIn(BaseModel): url:str; archive_history:bool=False
+class UserIn(BaseModel): username:str; archive_all:bool=True
 class PolicyIn(BaseModel): policy:dict
 class GroupIn(BaseModel): name:str
 class SettingsIn(BaseModel): check_interval_minutes:int|None=None; include_prereleases:bool|None=None
@@ -361,7 +451,20 @@ async def add_repo(body:RepoIn):
     c=db()
     if c.execute("SELECT id FROM repos WHERE full_name=?",(full,)).fetchone(): c.close(); raise HTTPException(409,"Repository is already tracked")
     t=now(); c.execute("INSERT INTO repos(full_name,url,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",(full,f"https://github.com/{full}",full.split("/",1)[1],"never",t,t))
-    rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.commit(); c.close(); asyncio.create_task(check_repo(rid)); return {"id":rid,"full_name":full}
+    rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.commit(); c.close()
+    if body.archive_history: asyncio.create_task(import_repo_history(rid))
+    else: asyncio.create_task(check_repo(rid))
+    return {"id":rid,"full_name":full,"archive_history":body.archive_history}
+
+@app.post("/api/users/import")
+async def import_user_endpoint(body:UserIn):
+    username=body.username.strip().lstrip("@")
+    if not username: raise HTTPException(400,"GitHub username is required")
+    try:
+        results=await import_user(username,body.archive_all)
+    except Exception as e:
+        raise HTTPException(400,str(e))
+    return {"username":username,"count":len(results),"repositories":results}
 
 @app.delete("/api/repos/{repo_id}")
 async def delete_repo(repo_id:int):
