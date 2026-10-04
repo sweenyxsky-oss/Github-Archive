@@ -1,0 +1,14 @@
+services:
+  github-archive:
+    image: ghcr.io/danger-mind/github-archive:latest
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Riyadh
+      GITHUB_TOKEN: ""
+      CHECK_INTERVAL_MINUTES: "360"
+      INCLUDE_PRERELEASES: "false"
+      MAX_DOWNLOAD_RETRIES: "4"
+    ports:
+      - "8088:8080"
+    volumes:
+      - /mnt/dataPool/GitHubArchive:/data
