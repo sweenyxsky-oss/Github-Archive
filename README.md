@@ -2,88 +2,112 @@
 
 A self-hosted GitHub release/tag archiver designed for TrueNAS SCALE.
 
-## What it does
+## v2 features
 
-For every tracked repository the service periodically checks GitHub:
-
-1. If a GitHub Release exists, it uses the newest non-draft Release.
-2. If there are no usable Releases, it falls back to the newest Git tag.
-3. A new version is archived only once.
-4. Interrupted downloads are kept as `.part` files and resumed on the next attempt.
-5. Every archived version contains:
-   - `release/` — all Release assets
-   - `source/` — source archive for the exact release/tag
-   - `repository-current/` — source archive of the repository default branch at discovery time
-6. Older versions are never deleted automatically.
-7. The web dashboard provides repository status, version history, GitHub links, and direct local downloads.
+- Automatic release/tag detection with **Release + tag fallback**, **Tags only**, or **Both releases and tags** modes.
+- Persistent SQLite-backed download queue with configurable workers.
+- Streaming downloads with resumable `.part` files and retries.
+- SHA-256 verification and GitHub digest verification when supplied.
+- Per-version `metadata.json` records repository, tag, commit, branch, release and asset metadata.
+- Release assets, exact tag/release source and default-branch current source.
+- Optional GitHub Actions artifact archiving.
+- Optional commit snapshot archiving.
+- Repository archive policies configurable from the dashboard.
+- Repository groups/categories.
+- Storage dashboard with free/used capacity and largest repositories.
+- Integrity page with **Verify Everything**.
+- Archive browser and direct local downloads.
+- **What's New?** activity dashboard.
+- Search and repository health/status.
+- Configurable checking interval from the web UI.
+- GitHub webhook endpoint for near-real-time checks, with polling fallback.
+- JSON REST API for automation and external integrations.
+- Older versions are append-only and are never automatically deleted.
 
 ## Storage layout
 
-The TrueNAS dataset mounted at `/data` becomes:
-
-```text
+```
 /data/
   github_archive.sqlite3
   repos/
     owner/
       repository/
         version/
+          metadata.json
           release/
           source/
           repository-current/
+          actions/
+          commits/
 ```
 
 ## TrueNAS SCALE
 
 Recommended dataset:
 
-```text
-/mnt/dataPool/GitHubArchive
-```
+`/mnt/dataPool/GitHubArchive`
 
-The included `truenas.yaml` maps that dataset to `/data` and exposes the dashboard on port `8088`.
+The included `truenas.yaml` maps that dataset to `/data` and exposes the dashboard on port **8088**.
 
-In the TrueNAS Custom App YAML editor, paste `truenas.yaml`. Change the host path if your pool/dataset name differs.
+Environment variables:
 
-### GitHub token
+- `GITHUB_TOKEN` — optional for public repositories; recommended for larger collections.
+- `CHECK_INTERVAL_MINUTES` — initial default, 360 minutes.
+- `INCLUDE_PRERELEASES` — initial default, false.
+- `MAX_DOWNLOAD_RETRIES` — default 4.
+- `DOWNLOAD_WORKERS` — concurrent download workers, default 2.
+- `WEBHOOK_SECRET` — optional HMAC secret for GitHub webhook verification.
+- `TZ` — default Asia/Riyadh.
 
-A token is optional for public repositories, but recommended for larger collections because authenticated GitHub API requests have higher rate limits.
+The interval and prerelease setting can also be changed in the dashboard after installation.
 
-Set `GITHUB_TOKEN` in the TrueNAS application environment. Do not commit a real token to this repository.
+### GitHub webhook
 
-### Settings
+Create a repository webhook pointing to:
 
-- `CHECK_INTERVAL_MINUTES`: default 360 (6 hours)
-- `INCLUDE_PRERELEASES`: default false
-- `MAX_DOWNLOAD_RETRIES`: default 4
-- `TZ`: default Asia/Riyadh
+`http://YOUR-TRUENAS-HOST:8088/api/webhook`
 
-## Local Docker
+Use **application/json**. Recommended events are **Release** and **Create** (for tag creation). Set the same secret in `WEBHOOK_SECRET`. If the service is not reachable from GitHub, use the normal scheduled polling.
+
+### Local Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-Then open:
+Open `http://localhost:8088`.
 
-```text
-http://localhost:8088
-```
+### GHCR
 
-## GHCR image
+The GitHub Actions workflow publishes:
 
-The included GitHub Actions workflow publishes:
+`ghcr.io/sweenyxsky-oss/github-archive:latest`
 
-```text
-ghcr.io/danger-mind/github-archive:latest
-```
+and version tags such as `v2.0.0`.
 
-It also publishes Git tags such as `v1.1.0`.
+## API
+
+Examples:
+
+- `GET /api/repos`
+- `POST /api/check-all`
+- `GET /api/repos/{id}/versions`
+- `GET /api/queue`
+- `POST /api/queue/{id}/retry`
+- `GET /api/storage`
+- `GET /api/storage/repos`
+- `GET /api/verify`
+- `GET /api/search?q=...`
+- `GET /api/activity`
+- `GET /api/groups`
+- `GET /api/settings`
+- `PUT /api/settings`
+- `POST /api/webhook`
 
 ## Important behavior
 
-A Release is preferred over tags. Therefore, if a project has Releases, ordinary tags are not treated as newer versions. For tag-only projects, the latest GitHub tag is used.
+A release is preferred in **Release + tag fallback** mode. **Tags only** ignores releases. **Both releases and tags** archives the newest usable release and the newest tag when they differ.
 
-The current repository snapshot is downloaded separately for every discovered version, so the archive records what the default branch looked like when that version was detected.
+For every archived version, the service can preserve release assets, exact source and a snapshot of the default branch. Optional Actions artifacts and commit snapshots can be enabled per repository.
 
-The database is the source of truth for download state. A final file is only marked complete after the download finishes and, where GitHub supplies a SHA-256 digest, the digest is verified.
+The database is the source of truth for download state. A file is marked complete only after its final download is present, its expected size matches when known, and SHA-256 verification succeeds. Interrupted downloads remain as `.part` files and resume automatically.
