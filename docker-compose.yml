@@ -1,0 +1,14 @@
+services:
+  github-archive:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    environment:
+      TZ: Asia/Riyadh
+      GITHUB_TOKEN: ""
+      CHECK_INTERVAL_MINUTES: "360"
+      INCLUDE_PRERELEASES: "false"
+      MAX_DOWNLOAD_RETRIES: "4"
+    volumes:
+      - ./data:/data
