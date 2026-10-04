@@ -149,7 +149,7 @@ def upsert_file(c,vid,cat,name,rel,url,size=None,digest=None):
 def enqueue(c,fid):
     c.execute("INSERT OR IGNORE INTO queue(file_id,status,queued_at) VALUES(?,'queued',?)",(fid,now()))
 
-async def create_manifest(repo,version,info):
+async def create_manifest(repo,version,info,include_current=True):
     policy=policy_for(repo); base,release,source,current,actions,commits=repo_dirs(repo["full_name"],version["version"])
     for d in (release,source,current,actions,commits): d.mkdir(parents=True,exist_ok=True)
     c=db()
@@ -159,7 +159,7 @@ async def create_manifest(repo,version,info):
     if policy.get("source",True):
         n=f"{safe_name(repo['name'])}-{safe_name(version['tag_name'])}-source.zip"
         upsert_file(c,version["id"],"source",n,str(Path("source")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['tag_name'],safe='')}")
-    if policy.get("current",True):
+    if include_current and policy.get("current",True):
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
         upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
     rows=c.execute("SELECT * FROM files WHERE version_id=?",(version["id"],)).fetchall()
@@ -298,12 +298,17 @@ async def import_repo_history(repo_id):
             c=db(); v=upsert_version(c,repo_now,info); c.commit(); known=c.execute(
                 "SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone(); c.close()
             if known["status"]!="complete":
-                await create_manifest(repo_now,known,info)
+                await create_manifest(repo_now,known,info,include_current=False)
+        if releases:
+            latest=releases[0]
+            latest["default_branch"]=meta["default_branch"]
+            c=db(); lv=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,latest["tag_name"])).fetchone(); c.close()
+            if lv: await create_manifest(repo_now,lv,latest,include_current=True)
         c=db()
         c.execute("UPDATE repos SET status='queued',latest_version=?,latest_kind='release',latest_date=?,latest_url=?,last_checked_at=?,updated_at=? WHERE id=?",
-                  ((releases[-1]["version"] if releases else None),
-                   (releases[-1]["published_at"] if releases else None),
-                   (releases[-1]["html_url"] if releases else None),now(),now(),repo_id))
+                  ((releases[0]["version"] if releases else None),
+                   (releases[0]["published_at"] if releases else None),
+                   (releases[0]["html_url"] if releases else None),now(),now(),repo_id))
         c.commit(); c.close(); queue_event.set()
         if not releases:
             await check_repo(repo_id)
