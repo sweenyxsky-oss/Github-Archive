@@ -75,6 +75,8 @@ def now(): return datetime.now(timezone.utc).isoformat()
 def db():
     DATA_DIR.mkdir(parents=True, exist_ok=True); REPOS_DIR.mkdir(parents=True, exist_ok=True)
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; c.execute("PRAGMA foreign_keys=ON"); c.executescript(SCHEMA)
+    cols={r["name"] for r in c.execute("PRAGMA table_info(repos)").fetchall()}
+    if "monitoring" not in cols: c.execute("ALTER TABLE repos ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1")
     defaults={"check_interval_minutes":str(DEFAULT_INTERVAL),"include_prereleases":str(DEFAULT_PRERELEASES).lower()}
     for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
     c.commit(); return c
@@ -380,7 +382,7 @@ async def scheduler():
     await asyncio.sleep(5)
     while True:
         try:
-            c=db(); rows=c.execute("SELECT * FROM repos").fetchall(); interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL); c.close()
+            c=db(); rows=c.execute("SELECT * FROM repos WHERE monitoring=1").fetchall(); interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL); c.close()
             t=datetime.now(timezone.utc)
             for r in rows:
                 due=True
@@ -396,6 +398,7 @@ async def scheduler():
 
 class RepoIn(BaseModel): url:str; archive_history:bool=False
 class UserIn(BaseModel): username:str; archive_all:bool=True
+class MonitoringIn(BaseModel): enabled:bool
 class PolicyIn(BaseModel): policy:dict
 class GroupIn(BaseModel): name:str
 class SettingsIn(BaseModel): check_interval_minutes:int|None=None; include_prereleases:bool|None=None
@@ -440,6 +443,13 @@ async def add_group(body:GroupIn):
 @app.delete("/api/groups/{gid}")
 async def delete_group(gid:int):
     c=db(); c.execute("DELETE FROM groups WHERE id=?",(gid,)); c.commit(); c.close(); return {"ok":True}
+
+@app.put("/api/repos/{repo_id}/monitoring")
+async def set_monitoring(repo_id:int, body:MonitoringIn):
+    c=db()
+    if not c.execute("SELECT 1 FROM repos WHERE id=?",(repo_id,)).fetchone(): c.close(); raise HTTPException(404,"Repository not found")
+    c.execute("UPDATE repos SET monitoring=?,updated_at=? WHERE id=?",(1 if body.enabled else 0,now(),repo_id)); c.commit(); row=c.execute("SELECT monitoring FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
+    return {"ok":True,"monitoring":bool(row["monitoring"])}
 
 @app.get("/api/repos")
 async def list_repos():
@@ -594,8 +604,9 @@ async def webhook(request:Request):
     except Exception: raise HTTPException(400,"Invalid JSON")
     repo=payload.get("repository",{}).get("full_name")
     if not repo: return {"ok":True,"queued":False}
-    c=db(); r=c.execute("SELECT id FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
-    if r: asyncio.create_task(check_repo(r["id"])); return {"ok":True,"queued":True,"repository":repo}
+    c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
+    if r and r["monitoring"]: asyncio.create_task(check_repo(r["id"])); return {"ok":True,"queued":True,"repository":repo}
+    if r: return {"ok":True,"queued":False,"repository":repo,"monitoring":False}
     return {"ok":True,"queued":False,"repository":repo}
 
 @app.get("/api/activity")
