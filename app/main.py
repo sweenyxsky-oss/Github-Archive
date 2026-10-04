@@ -107,6 +107,7 @@ async def discover(repo, policy):
         meta=await gh_json(client,api)
         releases=await gh_json(client,api+"/releases?per_page=30")
         chosen=None
+        tag_info=None
         for rel in releases:
             if rel.get("draft") or (rel.get("prerelease") and not policy.get("prereleases",False)): continue
             chosen={"version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release","published_at":rel.get("published_at") or rel.get("created_at"),
@@ -120,7 +121,10 @@ async def discover(repo, policy):
             tag_info={"version":tag["name"],"tag_name":tag["name"],"kind":"tag","published_at":commit.get("commit",{}).get("committer",{}).get("date"),
                       "html_url":f"https://github.com/{repo}/releases/tag/{quote(tag['name'],safe='')}","sha":sha,"assets":[]}
             if chosen is None or policy.get("tags_only",False): chosen=tag_info
-        chosen["default_branch"]=meta["default_branch"]; return meta,chosen
+        if chosen is None: return meta,None
+        chosen["default_branch"]=meta["default_branch"]
+        if tag_info: tag_info["default_branch"]=meta["default_branch"]
+        return meta,(chosen,tag_info)
 
 def policy_for(repo):
     try: return json.loads(repo["policy"] or "{}")
@@ -249,14 +253,18 @@ async def check_repo(repo_id):
         c=db(); repo=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
         if not repo: raise HTTPException(404,"Repository not found")
         try:
-            policy=policy_for(repo); meta,info=await discover(repo["full_name"],policy)
+            policy=policy_for(repo); meta,discovered=await discover(repo["full_name"],policy)
+            info,tag_info=discovered if discovered else (None,None)
             c=db(); c.execute("UPDATE repos SET name=?,default_branch=?,status='checking',error=NULL,updated_at=? WHERE id=?",(meta["name"],meta["default_branch"],now(),repo_id)); c.commit()
             if info is None:
                 c.execute("UPDATE repos SET status='no_version',last_checked_at=?,updated_at=? WHERE id=?",(now(),now(),repo_id)); c.commit(); c.close(); return {"status":"no_version"}
-            v=upsert_version(c,dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone()),info); c.commit()
-            # Preserve exact release metadata for already-known versions by only using current info for a new version.
+            repo_now=dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone())
+            v=upsert_version(c,repo_now,info); c.commit()
             known=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone()
-            if known["status"]!="complete": await create_manifest(dict(repo),known,info)
+            if known["status"]!="complete": await create_manifest(repo_now,known,info)
+            if policy.get("mode")=="both" and tag_info and tag_info["tag_name"]!=info["tag_name"]:
+                tv=upsert_version(c,repo_now,tag_info); c.commit()
+                if tv["status"]!="complete": await create_manifest(repo_now,tv,tag_info)
             c.execute("UPDATE repos SET latest_version=?,latest_kind=?,latest_date=?,latest_url=?,last_checked_at=?,status='queued',error=NULL,updated_at=? WHERE id=?",
                       (info["version"],info["kind"],info["published_at"],info["html_url"],now(),now(),repo_id)); c.commit(); c.close(); queue_event.set()
             return {"status":"queued","version":info["version"],"kind":info["kind"]}
