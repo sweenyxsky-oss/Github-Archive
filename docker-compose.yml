@@ -10,5 +10,7 @@ services:
       CHECK_INTERVAL_MINUTES: "360"
       INCLUDE_PRERELEASES: "false"
       MAX_DOWNLOAD_RETRIES: "4"
+      DOWNLOAD_WORKERS: "2"
+      WEBHOOK_SECRET: ""
     volumes:
       - ./data:/data
