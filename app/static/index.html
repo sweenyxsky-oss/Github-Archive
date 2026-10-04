@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Archive</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2b;--line:#26324a;--text:#e8edf7;--muted:#94a3b8;--accent:#6ea8fe;--good:#55d187;--bad:#ff6b6b;--warn:#f5c451}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:24px 28px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:16px}
+h1{margin:0;font-size:25px}main{max-width:1250px;margin:auto;padding:24px}
+.toolbar{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}input{background:#0d1526;color:var(--text);border:1px solid var(--line);padding:11px 12px;border-radius:8px;min-width:260px;outline:none}
+button,a.btn{border:0;border-radius:8px;padding:10px 13px;background:#1c2b48;color:var(--text);cursor:pointer;text-decoration:none;display:inline-block}
+button.primary{background:#2f6feb}button.danger{background:#6b2027}.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:13px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{color:var(--muted);font-weight:600}
+tr:last-child td{border-bottom:0}.status{font-weight:600}.complete{color:var(--good)}.failed{color:var(--bad)}.checking,.downloading{color:var(--warn)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:14px}
+.hidden{display:none}.actions{display:flex;gap:7px;flex-wrap:wrap}.back{margin-bottom:15px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.stat{padding:15px;background:#0d1526;border:1px solid var(--line);border-radius:8px}.stat b{display:block;font-size:20px;margin-top:5px}
+small{color:var(--muted)}code{background:#0b1322;padding:2px 5px;border-radius:4px}
+@media(max-width:800px){main{padding:12px}header{padding:18px 14px}th:nth-child(3),td:nth-child(3){display:none}}
+</style>
+</head>
+<body>
+<header><div><h1>GitHub Archive</h1><div class="muted">Release/tag snapshots with resumable downloads</div></div><div class="actions"><button onclick="checkAll()">Check All</button><button class="primary" onclick="addRepo()">Add Repository</button></div></header>
+<main>
+<section id="listView">
+<div class="toolbar"><input id="search" placeholder="Search repositories..." oninput="render()"><button onclick="load()">Refresh</button></div>
+<div id="table"></div>
+</section>
+<section id="detailView" class="hidden">
+<div class="back"><button onclick="showList()">← Back</button></div>
+<div id="detail"></div>
+</section>
+</main>
+<script>
+let repos=[],current=null;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=s=>s?new Date(s).toLocaleString():'—';
+async function api(url,opt){const r=await fetch(url,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.detail||j.error||r.statusText);return j}
+async function load(){repos=await api('/api/repos');render()}
+function render(){
+ const q=document.getElementById('search').value.toLowerCase();
+ const rows=repos.filter(r=>(r.full_name+' '+(r.latest_version||'')).toLowerCase().includes(q));
+ document.getElementById('table').innerHTML='<table><thead><tr><th>Repository</th><th>Latest</th><th>Date</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+
+ rows.map(r=>'<tr><td><b>'+esc(r.name)+'</b><br><small>'+esc(r.full_name)+'</small></td><td><b>'+esc(r.latest_version||'—')+'</b><br><small>'+esc(r.latest_kind||'')+'</small></td><td>'+fmt(r.latest_date)+'</td><td class="status '+esc(r.status)+'">'+esc(r.status)+(r.error?'<br><small>'+esc(r.error).slice(0,140)+'</small>':'')+'</td><td><div class="actions"><a class="btn" href="'+esc(r.url)+'" target="_blank">GitHub</a><button onclick="openRepo('+r.id+')">Archive</button><button onclick="checkOne('+r.id+')">Check</button></div></td></tr>').join('')+
+ '</tbody></table>';
+}
+async function addRepo(){const url=prompt('GitHub repository URL:');if(!url)return;try{await api('/api/repos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});await load();}catch(e){alert(e.message)}}
+async function checkOne(id){try{await api('/api/repos/'+id+'/check',{method:'POST'});await load()}catch(e){alert(e.message);await load()}}
+async function checkAll(){try{await api('/api/check-all',{method:'POST'});await load()}catch(e){alert(e.message)}}
+async function openRepo(id){
+ current=id;document.getElementById('listView').classList.add('hidden');document.getElementById('detailView').classList.remove('hidden');
+ const r=repos.find(x=>x.id===id), vs=await api('/api/repos/'+id+'/versions');
+ document.getElementById('detail').innerHTML='<div class="card"><h2>'+esc(r.full_name)+'</h2><div class="actions"><a class="btn" href="'+esc(r.url)+'" target="_blank">Open GitHub</a><button onclick="checkOne('+id+')">Check Now</button></div></div>'+
+ '<div class="card"><h3>Version history</h3>'+ (vs.length?vs.map(v=>'<div class="card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><b>'+esc(v.version)+'</b> <small>'+esc(v.kind)+'</small><br><small>'+fmt(v.published_at)+'</small></div><span class="status '+esc(v.status)+'">'+esc(v.status)+'</span><button onclick="openVersion('+v.id+')">Files</button></div></div>').join(''):'<p class="muted">No versions archived yet.</p>')+'</div>';
+}
+async function openVersion(id){
+ const d=await api('/api/versions/'+id),v=d.version;
+ document.getElementById('detail').innerHTML='<div class="card"><button onclick="openRepo('+v.repo_id+')">← Versions</button><h2>'+esc(v.repo_name)+' — '+esc(v.version)+'</h2><p><span class="status '+esc(v.status)+'">'+esc(v.status)+'</span> · '+esc(v.kind)+' · '+fmt(v.published_at)+'</p><div class="grid"><div class="stat">Release files<b>'+d.files.filter(x=>x.category==='release').length+'</b></div><div class="stat">Exact source<b>'+d.files.filter(x=>x.category==='source').length+'</b></div><div class="stat">Current repository<b>'+d.files.filter(x=>x.category==='repository-current').length+'</b></div></div></div>'+
+ '<div class="card"><h3>Archived files</h3><table><thead><tr><th>Type</th><th>File</th><th>Status</th><th></th></tr></thead><tbody>'+d.files.map(f=>'<tr><td>'+esc(f.category)+'</td><td>'+esc(f.name)+'</td><td class="status '+esc(f.status)+'">'+esc(f.status)+(f.size?' · '+Math.round(f.size/1048576*10)/10+' MB':'')+'</td><td>'+(f.status==='complete'?'<a class="btn" href="/download/'+f.id+'">Download</a>':'—')+'</td></tr>').join('')+'</tbody></table></div>';
+}
+function showList(){document.getElementById('detailView').classList.add('hidden');document.getElementById('listView').classList.remove('hidden');load()}
+load();
+</script>
+</body>
+</html>
