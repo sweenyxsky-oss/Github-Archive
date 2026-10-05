@@ -1000,3 +1000,17 @@ async def webhook(request:Request):
     repo=payload.get("repository",{}).get("full_name")
     if not repo: return {"ok":True,"queued":False}
     c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
+    repo=payload.get("repository",{}).get("full_name")
+    if not repo: return {"ok":True,"queued":False}
+    c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
+    if r and r["monitoring"]: asyncio.create_task(check_repo(r["id"])); return {"ok":True,"queued":True,"repository":repo}
+    if r: return {"ok":True,"queued":False,"repository":repo,"monitoring":False}
+    return {"ok":True,"queued":False,"repository":repo}
+
+@app.get("/api/activity")
+async def activity():
+    c=db(); rows=c.execute("""SELECT 'version' type,v.updated_at timestamp,r.full_name,v.version,v.status,v.error
+      FROM versions v JOIN repos r ON r.id=v.repo_id
+      UNION ALL SELECT 'file' type,f.downloaded_at timestamp,r.full_name,f.name,f.status,f.error
+      FROM files f JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
+      WHERE f.downloaded_at IS NOT NULL ORDER BY timestamp DESC LIMIT 100""").fetchall(); c.close(); return [rd(x) for x in rows]
