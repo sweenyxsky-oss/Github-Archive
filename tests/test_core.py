@@ -2,6 +2,8 @@ import os
 import tempfile
 import unittest
 
+from fastapi.testclient import TestClient
+
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="github-archive-test-")
 os.environ["DOWNLOAD_WORKERS"] = "1"
 
@@ -15,6 +17,15 @@ class CoreTests(unittest.TestCase):
         for value in ("https://github.com/octocat/Hello-World/issues", "https://example.com/octocat/Hello-World", "github.com/octocat/Hello-World"):
             with self.assertRaises(ValueError):
                 main.parse_repo_url(value)
+
+    def test_frontend_static_and_empty_repos_api(self):
+        with TestClient(main.app) as client:
+            static = client.get("/static/app.js")
+            self.assertEqual(static.status_code, 200)
+            self.assertIn("async function init()", static.text)
+            repos = client.get("/api/repos")
+            self.assertEqual(repos.status_code, 200)
+            self.assertEqual(repos.json(), [])
 
     def test_safe_name(self):
         self.assertEqual(main.safe_name("hello world"), "hello_world")
