@@ -22,6 +22,8 @@ REPOS_DIR = DATA_DIR / "repos"
 DEFAULT_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL_MINUTES", "360")))
 DEFAULT_PRERELEASES = os.getenv("INCLUDE_PRERELEASES", "false").lower() == "true"
 MAX_RETRIES = max(1, int(os.getenv("MAX_DOWNLOAD_RETRIES", "4")))
+API_RETRIES = max(1, int(os.getenv("MAX_API_RETRIES", "4")))
+API_MIN_INTERVAL = max(0.0, float(os.getenv("GITHUB_API_MIN_INTERVAL_SECONDS", "0.25")))
 WORKERS = max(1, int(os.getenv("DOWNLOAD_WORKERS", "2")))
 TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -42,6 +44,9 @@ check_lock = asyncio.Lock()
 background_task = None
 worker_tasks = []
 queue_event = asyncio.Event()
+api_request_lock = asyncio.Lock()
+api_next_request_at = 0.0
+api_rate_state = {"limit":None,"remaining":None,"reset":None,"authenticated":bool(TOKEN),"updated_at":None}
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -110,29 +115,86 @@ def gh_headers(auth=True):
     h={"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","User-Agent":"github-archive/2.0.0"}
     if auth and TOKEN: h["Authorization"]="Bearer "+TOKEN
     return h
+
+def _update_rate_state(headers):
+    global api_rate_state
+    def num(name):
+        value=headers.get(name)
+        try: return int(value) if value is not None else None
+        except (TypeError,ValueError): return None
+    api_rate_state={
+        "limit":num("X-RateLimit-Limit"),
+        "remaining":num("X-RateLimit-Remaining"),
+        "reset":num("X-RateLimit-Reset"),
+        "authenticated":bool(TOKEN),
+        "updated_at":now(),
+    }
+
+async def _api_wait():
+    global api_next_request_at
+    async with api_request_lock:
+        delay=api_next_request_at-asyncio.get_running_loop().time()
+        if delay>0: await asyncio.sleep(delay)
+        api_next_request_at=asyncio.get_running_loop().time()+API_MIN_INTERVAL
+
+def github_rate_status():
+    state=dict(api_rate_state)
+    if state["reset"]:
+        state["reset_at"]=datetime.fromtimestamp(state["reset"],timezone.utc).isoformat()
+        state["reset_in_seconds"]=max(0,state["reset"]-int(datetime.now(timezone.utc).timestamp()))
+    else:
+        state["reset_at"]=None
+        state["reset_in_seconds"]=None
+    state["token_configured"]=bool(TOKEN)
+    state["warning"]=(
+        "GITHUB_TOKEN is not configured; GitHub API requests are unauthenticated."
+        if not TOKEN else None
+    )
+    return state
+
 async def gh_json(client,url):
     last=None
-    for attempt in range(4):
+    for attempt in range(API_RETRIES):
         try:
+            await _api_wait()
             r=await client.get(url,headers=gh_headers())
+            _update_rate_state(r.headers)
             if r.status_code < 400: return r.json()
-            last=RuntimeError(f"GitHub API {r.status_code}: {r.text[:500]}")
-            rate_limited = r.status_code==403 and r.headers.get("X-RateLimit-Remaining")=="0"
-            secondary_limited = r.status_code in (403,429) and bool(r.headers.get("Retry-After"))
-            if r.status_code not in (403,429,500,502,503,504) and not rate_limited and not secondary_limited: raise last
-            retry_after=r.headers.get("Retry-After")
+
+            body=r.text[:500]
+            remaining=r.headers.get("X-RateLimit-Remaining")
             reset_at=r.headers.get("X-RateLimit-Reset")
-            if retry_after and retry_after.replace(".","",1).isdigit():
-                delay=min(60,max(1,float(retry_after)))
-            elif reset_at and reset_at.isdigit():
-                delay=min(60,max(1,int(reset_at)-int(datetime.now(timezone.utc).timestamp())))
+            retry_after=r.headers.get("Retry-After")
+            primary_limited = remaining == "0"
+            secondary_limited = r.status_code in (403,429) and (
+                bool(retry_after) or "secondary rate limit" in body.lower()
+            )
+            retryable_server = r.status_code in (500,502,503,504)
+            last=RuntimeError(f"GitHub API {r.status_code}: {body}")
+
+            if not (primary_limited or secondary_limited or retryable_server):
+                raise last
+
+            if primary_limited and reset_at and reset_at.isdigit():
+                delay=max(1,int(reset_at)-int(datetime.now(timezone.utc).timestamp())+1)
+                if attempt+1 >= API_RETRIES:
+                    raise RuntimeError(
+                        f"{last}. GitHub rate limit exhausted; retry after "
+                        f"{datetime.fromtimestamp(int(reset_at),timezone.utc).isoformat()}"
+                    )
+            elif retry_after:
+                try: delay=max(1,float(retry_after))
+                except ValueError: delay=60
+            elif secondary_limited:
+                delay=max(60,2**attempt*60)
             else:
-                delay=min(8,2**attempt)
+                delay=min(30,2**attempt)
+
             await asyncio.sleep(delay)
         except (httpx.TimeoutException,httpx.NetworkError) as e:
             last=e
-            if attempt==3: raise
-            await asyncio.sleep(min(8,2**attempt))
+            if attempt+1 >= API_RETRIES: raise
+            await asyncio.sleep(min(30,2**attempt))
     raise last or RuntimeError("GitHub API request failed")
 
 async def resolve_tag_sha(client,repo,tag_name):
@@ -623,6 +685,22 @@ async def shutdown():
 async def index(): return HTMLResponse((Path(__file__).parent/"static"/"index.html").read_text(encoding="utf-8"))
 @app.get("/health")
 async def health(): return {"ok":True,"version":"2.0.0","workers":WORKERS}
+
+@app.get("/api/github/rate-limit")
+async def github_rate_limit():
+    if not TOKEN:
+        return github_rate_status()
+    async with httpx.AsyncClient(timeout=30) as client:
+        data=await gh_json(client,"https://api.github.com/rate_limit")
+    core=(data.get("resources") or {}).get("core") or {}
+    api_rate_state.update({
+        "limit":core.get("limit"),
+        "remaining":core.get("remaining"),
+        "reset":core.get("reset"),
+        "authenticated":True,
+        "updated_at":now(),
+    })
+    return github_rate_status()
 
 @app.get("/api/settings")
 async def settings():
