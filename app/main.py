@@ -95,6 +95,7 @@ def db():
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; c.execute("PRAGMA foreign_keys=ON"); c.executescript(SCHEMA)
     cols={r["name"] for r in c.execute("PRAGMA table_info(repos)").fetchall()}
     if "monitoring" not in cols: c.execute("ALTER TABLE repos ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1")
+    if "archive_history" not in cols: c.execute("ALTER TABLE repos ADD COLUMN archive_history INTEGER NOT NULL DEFAULT 0")
     defaults={"check_interval_minutes":str(DEFAULT_INTERVAL),"include_prereleases":str(DEFAULT_PRERELEASES).lower()}
     for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
     c.commit(); return c
@@ -543,9 +544,9 @@ async def import_user(username, archive_all=True):
             rid=existing["id"]
         else:
             t=now()
-            c.execute("INSERT INTO repos(full_name,url,name,default_branch,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO repos(full_name,url,name,default_branch,status,archive_history,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                       (full,f"https://github.com/{full}",item.get("name") or full.split("/",1)[1],
-                       item.get("default_branch"),"never",t,t))
+                       item.get("default_branch"),"never",1 if archive_all else 0,t,t))
             rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
             c.commit()
         c.close()
@@ -752,7 +753,7 @@ async def add_repo(body:RepoIn):
     except ValueError as e: raise HTTPException(400,str(e))
     c=db()
     if c.execute("SELECT id FROM repos WHERE full_name=?",(full,)).fetchone(): c.close(); raise HTTPException(409,"Repository is already tracked")
-    t=now(); c.execute("INSERT INTO repos(full_name,url,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",(full,f"https://github.com/{full}",full.split("/",1)[1],"never",t,t))
+    t=now(); c.execute("INSERT INTO repos(full_name,url,name,status,archive_history,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(full,f"https://github.com/{full}",full.split("/",1)[1],"never",1 if body.archive_history else 0,t,t))
     rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.commit(); c.close()
     if body.archive_history: asyncio.create_task(import_repo_history(rid))
     else: asyncio.create_task(check_repo(rid))
@@ -807,6 +808,17 @@ async def clear_group(repo_id:int):
 
 @app.post("/api/repos/{repo_id}/check")
 async def manual_check(repo_id:int): return await check_repo(repo_id)
+
+@app.post("/api/repos/{repo_id}/retry")
+async def retry_repo(repo_id:int):
+    c=db(); repo=c.execute("SELECT id,status,archive_history FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
+    if not repo: raise HTTPException(404,"Repository not found")
+    if repo["status"]!="failed": return {"ok":True,"started":False,"status":repo["status"]}
+    if repo["archive_history"]:
+        asyncio.create_task(import_repo_history(repo_id))
+        return {"ok":True,"started":True,"mode":"historical"}
+    asyncio.create_task(check_repo(repo_id))
+    return {"ok":True,"started":True,"mode":"latest"}
 @app.post("/api/check-all")
 async def check_all():
     c=db(); ids=[r["id"] for r in c.execute("SELECT id FROM repos").fetchall()]; c.close(); results=[]
