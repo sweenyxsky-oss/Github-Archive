@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import sqlite3
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -659,6 +660,7 @@ class MonitoringIn(BaseModel): enabled:bool
 class PolicyIn(BaseModel): policy:dict
 class GroupIn(BaseModel): name:str
 class SettingsIn(BaseModel): check_interval_minutes:int|None=None; include_prereleases:bool|None=None
+class DeleteRepoIn(BaseModel): delete_files:bool=False
 
 def recover_interrupted_queue():
     c=db()
@@ -767,10 +769,24 @@ async def import_user_endpoint(body:UserIn):
     return {"username":username,"count":len(results),"repositories":results}
 
 @app.delete("/api/repos/{repo_id}")
-async def delete_repo(repo_id:int):
+async def delete_repo(repo_id:int, body:DeleteRepoIn|None=None):
+    delete_files=bool(body.delete_files) if body else False
     c=db(); r=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone()
-    if not r: c.close(); raise HTTPException(404,"Repository not found")
-    c.execute("DELETE FROM repos WHERE id=?",(repo_id,)); c.commit(); c.close(); return {"ok":True}
+    if not r:
+        c.close(); raise HTTPException(404,"Repository not found")
+
+    # The archive directory is derived only from the tracked GitHub full_name,
+    # so deletion is limited to this repository's own archive tree.
+    owner,name=r["full_name"].split("/",1)
+    repo_root=REPOS_DIR/safe_name(owner)/safe_name(name)
+    if delete_files and repo_root.exists():
+        try:
+            shutil.rmtree(repo_root)
+        except OSError as e:
+            c.close(); raise HTTPException(500,f"Could not delete downloaded files: {e}")
+
+    c.execute("DELETE FROM repos WHERE id=?",(repo_id,)); c.commit(); c.close()
+    return {"ok":True,"full_name":r["full_name"],"files_deleted":delete_files}
 
 @app.put("/api/repos/{repo_id}/policy")
 async def set_policy(repo_id:int,body:PolicyIn):
