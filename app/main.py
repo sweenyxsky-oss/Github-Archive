@@ -99,30 +99,59 @@ def gh_headers(auth=True):
     if auth and TOKEN: h["Authorization"]="Bearer "+TOKEN
     return h
 async def gh_json(client,url):
-    r=await client.get(url,headers=gh_headers())
-    if r.status_code>=400: raise RuntimeError(f"GitHub API {r.status_code}: {r.text[:500]}")
-    return r.json()
+    last=None
+    for attempt in range(4):
+        try:
+            r=await client.get(url,headers=gh_headers())
+            if r.status_code < 400: return r.json()
+            last=RuntimeError(f"GitHub API {r.status_code}: {r.text[:500]}")
+            if r.status_code not in (429,500,502,503,504): raise last
+            retry_after=r.headers.get("Retry-After")
+            delay=float(retry_after) if retry_after and retry_after.replace(".","",1).isdigit() else min(8,2**attempt)
+            await asyncio.sleep(delay)
+        except (httpx.TimeoutException,httpx.NetworkError) as e:
+            last=e
+            if attempt==3: raise
+            await asyncio.sleep(min(8,2**attempt))
+    raise last or RuntimeError("GitHub API request failed")
+
+async def resolve_tag_sha(client,repo,tag_name):
+    ref=await gh_json(client,f"https://api.github.com/repos/{repo}/git/ref/tags/{quote(tag_name,safe='')}")
+    obj=ref.get("object") or {}
+    sha=obj.get("sha")
+    if not sha: raise RuntimeError(f"GitHub tag {tag_name} has no target SHA")
+    if obj.get("type")=="tag":
+        tag=await gh_json(client,f"https://api.github.com/repos/{repo}/git/tags/{sha}")
+        sha=(tag.get("object") or {}).get("sha") or sha
+    return sha
 
 async def discover(repo, policy):
     api=f"https://api.github.com/repos/{repo}"
     async with httpx.AsyncClient(timeout=45) as client:
         meta=await gh_json(client,api)
-        releases=await gh_json(client,api+"/releases?per_page=30")
+        releases=await gh_json(client,api+"/releases?per_page=100&page=1")
         chosen=None
         tag_info=None
         for rel in releases:
             if rel.get("draft") or (rel.get("prerelease") and not policy.get("prereleases",False)): continue
-            chosen={"version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release","published_at":rel.get("published_at") or rel.get("created_at"),
-                    "html_url":rel["html_url"],"sha":None,"assets":rel.get("assets",[])}
+            sha=await resolve_tag_sha(client,repo,rel["tag_name"])
+            chosen={"version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release",
+                    "published_at":rel.get("published_at") or rel.get("created_at"),
+                    "html_url":rel["html_url"],"sha":sha,"assets":rel.get("assets",[])}
             break
-        if chosen is None or policy.get("tags_only",False):
-            tags=await gh_json(client,api+"/tags?per_page=1")
-            if not tags: return meta,None
-            tag=tags[0]; sha=tag["commit"]["sha"]
-            commit=await gh_json(client,api+"/commits/"+sha)
-            tag_info={"version":tag["name"],"tag_name":tag["name"],"kind":"tag","published_at":commit.get("commit",{}).get("committer",{}).get("date"),
-                      "html_url":f"https://github.com/{repo}/releases/tag/{quote(tag['name'],safe='')}","sha":sha,"assets":[]}
-            if chosen is None or policy.get("tags_only",False): chosen=tag_info
+        mode=policy.get("mode","release_fallback")
+        want_tag=mode in ("tags_only","both") or chosen is None
+        if want_tag and policy.get("tags",True):
+            tags=await gh_json(client,api+"/tags?per_page=1&page=1")
+            if tags:
+                tag=tags[0]
+                sha=await resolve_tag_sha(client,repo,tag["name"])
+                commit=await gh_json(client,api+"/commits/"+sha)
+                tag_info={"version":tag["name"],"tag_name":tag["name"],"kind":"tag",
+                          "published_at":commit.get("commit",{}).get("committer",{}).get("date"),
+                          "html_url":f"https://github.com/{repo}/releases/tag/{quote(tag['name'],safe='')}",
+                          "sha":sha,"assets":[]}
+                if mode=="tags_only" or chosen is None: chosen=tag_info
         if chosen is None: return meta,None
         chosen["default_branch"]=meta["default_branch"]
         if tag_info: tag_info["default_branch"]=meta["default_branch"]
@@ -174,18 +203,19 @@ async def create_manifest(repo,version,info,include_current=True):
     c.close(); return base
 
 async def download_one(f):
-    c=db(); q=c.execute("SELECT * FROM queue WHERE file_id=?",(f["id"],)).fetchone()
-    if not q: c.execute("INSERT INTO queue(file_id,status,queued_at) VALUES(?,'queued',?)",(f["id"],now())); c.commit(); q=c.execute("SELECT * FROM queue WHERE file_id=?",(f["id"],)).fetchone()
-    if q["status"]=="done" and f["status"]=="complete": c.close(); return
-    c.execute("UPDATE queue SET status='running',started_at=?,attempts=attempts+1,error=NULL WHERE file_id=?",(now(),f["id"]))
-    c.execute("UPDATE files SET status='downloading',error=NULL WHERE id=?",(f["id"],)); c.commit(); c.close()
-    base=repo_dirs((await file_repo(f["id"]))["full_name"],(await file_repo(f["id"]))["version"])[0]
-    target=(base/Path(f["relative_path"])).resolve(); part=target.with_name(target.name+".part"); target.parent.mkdir(parents=True,exist_ok=True)
+    file_id=f["file_id"]
+    base=repo_dirs(f["full_name"],f["version"])[0]
+    target=(base/Path(f["relative_path"])).resolve()
+    if not str(target).startswith(str(base.resolve())+os.sep):
+        raise RuntimeError("Invalid archive path")
+    part=target.with_name(target.name+".part")
+    target.parent.mkdir(parents=True,exist_ok=True)
     expected=f["expected_size"]; digest=f["sha256"]
     try:
         for attempt in range(1,MAX_RETRIES+1):
             try:
-                start=part.stat().st_size if part.exists() else 0; headers=gh_headers()
+                start=part.stat().st_size if part.exists() else 0
+                headers=gh_headers()
                 if start: headers["Range"]=f"bytes={start}-"
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120,connect=30),follow_redirects=False) as client:
                     async with client.stream("GET",f["source_url"],headers=headers) as r:
@@ -212,34 +242,76 @@ async def download_one(f):
                 with part.open("rb") as inp:
                     for block in iter(lambda:inp.read(1024*1024),b""): h.update(block)
                 actual=h.hexdigest()
-                if digest and digest.startswith("sha256:") and actual.lower()!=digest.split(":",1)[1].lower(): raise RuntimeError("SHA-256 digest mismatch")
-                part.replace(target); c=db()
-                c.execute("UPDATE files SET status='complete',size=?,downloaded_at=?,error=NULL,verify_status=? WHERE id=?",(size,now(),"verified" if digest else "verified-local",f["id"]))
-                c.execute("UPDATE queue SET status='done',finished_at=?,error=NULL WHERE file_id=?",(now(),f["id"])); c.commit(); c.close(); return
-            except Exception as e:
+                if digest and digest.startswith("sha256:") and actual.lower()!=digest.split(":",1)[1].lower():
+                    raise RuntimeError("SHA-256 digest mismatch")
+                part.replace(target)
+                c=db()
+                c.execute("UPDATE files SET status='complete',size=?,downloaded_at=?,error=NULL,verify_status=? WHERE id=?",
+                          (size,now(),"verified" if digest else "verified-local",file_id))
+                c.execute("UPDATE queue SET status='done',finished_at=?,error=NULL WHERE id=?",
+                          (now(),f["queue_id"]))
+                c.commit(); c.close()
+                return
+            except Exception:
                 if attempt==MAX_RETRIES: raise
                 await asyncio.sleep(min(30,2**attempt))
     except Exception as e:
-        c=db(); c.execute("UPDATE files SET status='failed',error=?,verify_status='failed' WHERE id=?",(str(e)[:2000],f["id"]))
-        c.execute("UPDATE queue SET status='failed',finished_at=?,error=? WHERE file_id=?",(now(),str(e)[:2000],f["id"])); c.commit(); c.close()
+        c=db()
+        c.execute("UPDATE files SET status='failed',error=?,verify_status='failed' WHERE id=?",(str(e)[:2000],file_id))
+        c.execute("UPDATE queue SET status='failed',finished_at=?,error=? WHERE id=?",(now(),str(e)[:2000],f["queue_id"]))
+        c.commit(); c.close()
         raise
+
 
 async def file_repo(fid):
     c=db(); r=c.execute("SELECT f.*,v.version,v.repo_id,r.full_name,r.name AS repo_name FROM files f JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id WHERE f.id=?",(fid,)).fetchone(); c.close()
     if not r: raise RuntimeError("File not found")
     return r
 
+def claim_next_queue_item():
+    c=db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("""SELECT q.id queue_id,q.file_id,q.attempts,
+                                f.version_id,f.category,f.name,f.relative_path,f.source_url,
+                                f.expected_size,f.sha256,f.status file_status,
+                                v.version,r.full_name
+                         FROM queue q
+                         JOIN files f ON f.id=q.file_id
+                         JOIN versions v ON v.id=f.version_id
+                         JOIN repos r ON r.id=v.repo_id
+                         WHERE q.status='queued'
+                         ORDER BY q.id LIMIT 1""").fetchone()
+        if not row:
+            c.commit()
+            return None
+        changed=c.execute("""UPDATE queue SET status='running',started_at=?,attempts=attempts+1,error=NULL
+                             WHERE id=? AND status='queued'""",(now(),row["queue_id"])).rowcount
+        if changed != 1:
+            c.rollback()
+            return None
+        c.execute("UPDATE files SET status='downloading',error=NULL WHERE id=?",(row["file_id"],))
+        c.commit()
+        return dict(row)
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
 async def worker():
     while True:
         try:
-            c=db(); q=c.execute("SELECT q.*,f.* FROM queue q JOIN files f ON f.id=q.file_id WHERE q.status='queued' ORDER BY q.id LIMIT 1").fetchone(); c.close()
+            q=claim_next_queue_item()
             if not q:
                 try: await asyncio.wait_for(queue_event.wait(),timeout=10)
                 except asyncio.TimeoutError: pass
-                queue_event.clear(); continue
+                queue_event.clear()
+                continue
             try: await download_one(q)
             except Exception: pass
-        except Exception: await asyncio.sleep(2)
+        except Exception:
+            await asyncio.sleep(2)
 
 async def archive_version(repo,version,info):
     await create_manifest(repo,version,info)
