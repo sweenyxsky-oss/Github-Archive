@@ -245,7 +245,7 @@ async def archive_version(repo,version,info):
     await create_manifest(repo,version,info)
     # Version remains pending until its queue files are complete.
     c=db(); total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(version["id"],)).fetchone()["n"]; done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='complete'",(version["id"],)).fetchone()["n"]
-    if total==0: c.execute("UPDATE versions SET status='complete',updated_at=? WHERE id=?",(now(),version["id"]))
+    if total==0: c.execute("UPDATE versions SET status='complete',error=NULL,updated_at=? WHERE id=?",(now(),version["id"]))
     elif done==total: c.execute("UPDATE versions SET status='complete',error=NULL,updated_at=? WHERE id=?",(now(),version["id"]))
     else: c.execute("UPDATE versions SET status='queued',updated_at=? WHERE id=?",(now(),version["id"]))
     c.commit(); c.close(); queue_event.set()
@@ -374,7 +374,7 @@ async def refresh_version_statuses():
         total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(r["id"],)).fetchone()["n"]
         done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='complete'",(r["id"],)).fetchone()["n"]
         failed=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='failed'",(r["id"],)).fetchone()["n"]
-        status="complete" if total and done==total else ("failed" if failed else "queued")
+        status="complete" if done==total else ("failed" if failed else "queued")
         c.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
     c.commit(); c.close()
 
@@ -403,10 +403,22 @@ class PolicyIn(BaseModel): policy:dict
 class GroupIn(BaseModel): name:str
 class SettingsIn(BaseModel): check_interval_minutes:int|None=None; include_prereleases:bool|None=None
 
+def recover_interrupted_queue():
+    c=db()
+    c.execute("""UPDATE queue SET status='queued',started_at=NULL,error=COALESCE(error,'Recovered after service restart')
+                WHERE status='running'""")
+    c.execute("""UPDATE files SET status='pending',error=COALESCE(error,'Download resumed after service restart')
+                WHERE status='downloading'""")
+    c.commit()
+    c.close()
+
 @app.on_event("startup")
 async def startup():
     global background_task,worker_tasks
-    db().close(); worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]; background_task=asyncio.create_task(scheduler())
+    db().close()
+    recover_interrupted_queue()
+    worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]
+    background_task=asyncio.create_task(scheduler())
 @app.on_event("shutdown")
 async def shutdown():
     if background_task: background_task.cancel()
@@ -584,7 +596,11 @@ async def archive_tree():
 @app.get("/api/archive/list")
 async def archive_list(path:str=""):
     target=(DATA_DIR/path).resolve()
-    if not str(target).startswith(str(REPOS_DIR.resolve())) or not target.is_dir(): raise HTTPException(400,"Invalid archive path")
+    try:
+        target.relative_to(REPOS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400,"Invalid archive path")
+    if not target.is_dir(): raise HTTPException(400,"Invalid archive path")
     return {"path":str(target.relative_to(DATA_DIR)),"entries":[{"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":x.stat().st_size if x.is_file() else None} for x in sorted(target.iterdir(),key=lambda z:(not z.is_dir(),z.name.lower()))]}
 
 @app.get("/download/{file_id}")
@@ -602,6 +618,11 @@ async def webhook(request:Request):
         if not hmac.compare_digest(sig,expected): raise HTTPException(401,"Invalid webhook signature")
     try: payload=json.loads(body)
     except Exception: raise HTTPException(400,"Invalid JSON")
+    event=request.headers.get("x-github-event","").lower()
+    if event not in ("release","create","ping",""):
+        return {"ok":True,"queued":False,"event":event}
+    if event=="create" and payload.get("ref_type")!="tag":
+        return {"ok":True,"queued":False,"event":event}
     repo=payload.get("repository",{}).get("full_name")
     if not repo: return {"ok":True,"queued":False}
     c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
