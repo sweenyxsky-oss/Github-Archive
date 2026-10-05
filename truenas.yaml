@@ -10,6 +10,7 @@ services:
       MAX_DOWNLOAD_RETRIES: "4"
       DOWNLOAD_WORKERS: "2"
       WEBHOOK_SECRET: ""
+      ADMIN_TOKEN: ""
     ports:
       - "8088:8080"
     volumes:
