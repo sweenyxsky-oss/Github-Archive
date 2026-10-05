@@ -1,7 +1,17 @@
-let repos=[],groups=[],state={page:'dashboard',repo:null};
+let repos=[],groups=[],state={page:'dashboard',repo:null},adminToken=sessionStorage.getItem('githubArchiveAdminToken')||'';
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); const fmt=s=>s?new Date(s).toLocaleString():'—'; const bytes=n=>{n=Number(n||0);if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'};
-async function api(u,o){let r=await fetch(u,o),j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.detail||j.error||r.statusText);return j}
+async function api(u,o={},retry=true){
+  const opts={...o,headers:new Headers(o.headers||{})};
+  if(adminToken)opts.headers.set('Authorization','Bearer '+adminToken);
+  let r=await fetch(u,opts),j=await r.json().catch(()=>({}));
+  if(r.status===401&&retry){
+    const token=prompt('Archive admin token:');
+    if(token){adminToken=token.trim();sessionStorage.setItem('githubArchiveAdminToken',adminToken);return api(u,o,false)}
+  }
+  if(!r.ok)throw Error(j.detail||j.error||r.statusText);
+  return j;
+}
 async function init(){repos=await api('/api/repos');groups=await api('/api/groups');page('dashboard')}
 async function refresh(){repos=await api('/api/repos');groups=await api('/api/groups')}
 function nav(p){document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));document.getElementById('n-'+p)?.classList.add('active')}
