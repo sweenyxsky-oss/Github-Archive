@@ -10,13 +10,13 @@ A self-hosted GitHub release/tag archiver designed for TrueNAS SCALE.
 - SHA-256 verification and GitHub digest verification when supplied.
 - Per-version `metadata.json` records repository, tag, commit, branch, release and asset metadata.
 - Release assets, exact tag/release source and default-branch current source.
-- Optional GitHub Actions artifact archiving.
-- Optional commit snapshot archiving.
+- Optional GitHub Actions artifact archiving for artifacts produced by the archived commit.
+- Optional exact commit snapshot archiving.
 - Repository archive policies configurable from the dashboard.
 - Repository groups/categories.
 - Storage dashboard with free/used capacity and largest repositories.
 - Integrity page with **Verify Everything**.
-- Archive browser and direct local downloads.
+- Navigable archive browser and direct local downloads.
 - **What's New?** activity dashboard.
 - Search and repository health/status.
 - Configurable checking interval from the web UI.
@@ -56,7 +56,10 @@ Environment variables:
 - `INCLUDE_PRERELEASES` — initial default, false.
 - `MAX_DOWNLOAD_RETRIES` — default 4.
 - `DOWNLOAD_WORKERS` — concurrent download workers, default 2.
+
 - `WEBHOOK_SECRET` — optional HMAC secret for GitHub webhook verification.
+
+For private repositories, the GitHub token should have the repository Contents read permission; Actions artifact archiving also requires Actions read permission.
 - `TZ` — default Asia/Riyadh.
 
 The interval and prerelease setting can also be changed in the dashboard after installation.
@@ -110,4 +113,4 @@ A release is preferred in **Release + tag fallback** mode. **Tags only** ignores
 
 For every archived version, the service can preserve release assets, exact source and a snapshot of the default branch. Optional Actions artifacts and commit snapshots can be enabled per repository.
 
-The database is the source of truth for download state. A file is marked complete only after its final download is present, its expected size matches when known, and SHA-256 verification succeeds. Interrupted downloads remain as `.part` files and resume automatically.
+The database is the source of truth for download state. A file is marked complete only after its final download is present, its expected size matches when known, and SHA-256 verification succeeds. Queue claims are atomic, interrupted jobs are recovered after restart, and resumable `.part` files are preserved. Interrupted downloads remain as `.part` files and resume automatically.
