@@ -36,6 +36,22 @@ class CoreTests(unittest.TestCase):
         b=main.repo_dirs("octocat/test","release_foo")[0]
         self.assertNotEqual(a,b)
 
+    def test_changed_tag_sha_invalidates_version(self):
+        c = main.db()
+        t = main.now()
+        c.execute("INSERT INTO repos(full_name,url,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                  ("octocat/mutable", "https://github.com/octocat/mutable", "mutable", "queued", t, t))
+        rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        repo = c.execute("SELECT * FROM repos WHERE id=?", (rid,)).fetchone()
+        v = main.upsert_version(c, repo, {"version":"v1","tag_name":"v1","kind":"tag","published_at":t,"html_url":"https://github.com/octocat/mutable/releases/tag/v1","sha":"aaa"})
+        c.execute("UPDATE versions SET status='complete' WHERE id=?", (v["id"],))
+        c.commit()
+        v2 = main.upsert_version(c, repo, {"version":"v1","tag_name":"v1","kind":"tag","published_at":t,"html_url":"https://github.com/octocat/mutable/releases/tag/v1","sha":"bbb"})
+        c.commit()
+        self.assertEqual(v2["target_sha"], "bbb")
+        self.assertEqual(v2["status"], "pending")
+        c.close()
+
     def test_queue_claim_is_atomic_and_uses_file_id(self):
         c = main.db()
         t = main.now()
