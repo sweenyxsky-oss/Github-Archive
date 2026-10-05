@@ -108,13 +108,38 @@ async function submitAddRepo(){ const url=document.getElementById('repoUrlInput'
 async function checkAll(){try{await api('/api/check-all',{method:'POST'});await page(state.page)}catch(e){alert(e.message)}}
 
 async function repoPage(id){
-  try { await refresh(); let r=repos.find(x=>x.id===id); let vs=await api('/api/repos/'+id+'/versions'); let pol={releases:true,assets:true,source:true,current:true,tags:true,artifacts:false,commits:false,prereleases:false}; try{pol=JSON.parse(r.policy)}catch(e){} $('app').innerHTML='<div class="toolbar"><button data-click="page(\'repos\')">← Repositories</button></div><div class="grid"><div class="stat">Repository<b>'+esc(r.full_name)+'</b></div><div class="stat">Status<b><span class="status '+r.status+'">'+r.status+'</span></b></div><div class="stat">Versions<b>'+vs.length+'</b></div><div class="stat">Size<b>'+bytes(r.archive_size||0)+'</b></div></div><div class="card"><h3>Policy</h3><label>Mode<select id="pmode"><option value="release_fallback" '+(pol.mode==='release_fallback'?'selected':'')+'>Release with tag fallback</option><option value="tags_only" '+(pol.mode==='tags_only'?'selected':'')+'>Tags only</option><option value="both" '+(pol.mode==='both'?'selected':'')+'>Both releases and tags</option></select></label><label class="toggle"><input type="checkbox" '+(pol.releases?'checked':'')+'> Releases</label><label class="toggle"><input type="checkbox" '+(pol.assets?'checked':'')+'> Assets</label><label class="toggle"><input type="checkbox" '+(pol.tags?'checked':'')+'> Tags</label><label class="toggle"><input type="checkbox" '+(pol.source?'checked':'')+'> Exact source</label><label class="toggle"><input type="checkbox" '+(pol.current?'checked':'')+'> Current default branch</label><label class="toggle"><input type="checkbox" '+(pol.artifacts?'checked':'')+'> Actions artifacts</label><label class="toggle"><input type="checkbox" '+(pol.commits?'checked':'')+'> Commit snapshots</label><label class="toggle"><input type="checkbox" '+(pol.prereleases?'checked':'')+'> Prerelease versions</label><button data-click="savePolicy('+id+')">Save Policy</button></div><div class="card"><h3>Versions</h3>'+vs.map(v=>'<div style="padding:12px 0;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center"><div><b>'+esc(v.version)+'</b><br><small>'+v.kind+' • '+fmt(v.published_at)+'</small></div><button data-click="versionPage('+v.id+')">Details</button></div>').join('')+'</div>'; } catch(e) { $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
+  try { await refresh(); let r=repos.find(x=>x.id===id); let vs=await api('/api/repos/'+id+'/versions'); let pol={releases:true,assets:true,source:true,current:true,tags:true,artifacts:false,commits:false,prereleases:false}; try{pol=JSON.parse(r.policy)}catch(e){} $('app').innerHTML='<div class="toolbar"><button data-click="page(\'repos\')">← Repositories</button><button class="danger" data-click="delRepo('+id+')">Delete Repository</button></div><div class="grid"><div class="stat">Repository<b>'+esc(r.full_name)+'</b></div><div class="stat">Status<b><span class="status '+r.status+'">'+r.status+'</span></b></div><div class="stat">Versions<b>'+vs.length+'</b></div><div class="stat">Size<b>'+bytes(r.archive_size||0)+'</b></div></div><div class="card"><h3>Policy</h3><label>Mode<select id="pmode"><option value="release_fallback" '+(pol.mode==='release_fallback'?'selected':'')+'>Release with tag fallback</option><option value="tags_only" '+(pol.mode==='tags_only'?'selected':'')+'>Tags only</option><option value="both" '+(pol.mode==='both'?'selected':'')+'>Both releases and tags</option></select></label><label class="toggle"><input type="checkbox" '+(pol.releases?'checked':'')+'> Releases</label><label class="toggle"><input type="checkbox" '+(pol.assets?'checked':'')+'> Assets</label><label class="toggle"><input type="checkbox" '+(pol.tags?'checked':'')+'> Tags</label><label class="toggle"><input type="checkbox" '+(pol.source?'checked':'')+'> Exact source</label><label class="toggle"><input type="checkbox" '+(pol.current?'checked':'')+'> Current default branch</label><label class="toggle"><input type="checkbox" '+(pol.artifacts?'checked':'')+'> Actions artifacts</label><label class="toggle"><input type="checkbox" '+(pol.commits?'checked':'')+'> Commit snapshots</label><label class="toggle"><input type="checkbox" '+(pol.prereleases?'checked':'')+'> Prerelease versions</label><button data-click="savePolicy('+id+')">Save Policy</button></div><div class="card"><h3>Versions</h3>'+vs.map(v=>'<div style="padding:12px 0;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center"><div><b>'+esc(v.version)+'</b><br><small>'+v.kind+' • '+fmt(v.published_at)+'</small></div><button data-click="versionPage('+v.id+')">Details</button></div>').join('')+'</div>'; } catch(e) { $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
 }
 
 async function savePolicy(id){ let keys=['releases','assets','source','current','tags','artifacts','commits','prereleases'],p={mode:document.getElementById('pmode').value}; keys.forEach(k=>p[k]=document.querySelector('label:has(input:nth-child('+keys.indexOf(k)+1+')) input[type=checkbox]')?.checked||false); try{await api('/api/repos/'+id+'/policy',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy:p})});alert('Policy saved');await repoPage(id)}catch(e){alert(e.message)} }
 async function setMonitoring(id,enabled){try{await api('/api/repos/'+id+'/monitoring',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});repos=await api('/api/repos');}catch(e){alert(e.message)}}
 async function checkOne(id){try{await api('/api/repos/'+id+'/check',{method:'POST'});await repoPage(id)}catch(e){alert(e.message)}}
-async function delRepo(id){if(!confirm('Delete repository and its database record? Files on disk are NOT automatically deleted.'))return;try{await api('/api/repos/'+id,{method:'DELETE'});page('repos')}catch(e){alert(e.message)}}
+async function delRepo(id){
+  const r=repos.find(x=>x.id===id);
+  if(!r)return;
+  document.body.insertAdjacentHTML('beforeend',`<div class="modal-backdrop" id="deleteRepoModal"><div class="modal">
+    <h3>Delete Repository</h3>
+    <p>Remove <b>${esc(r.full_name)}</b> from GitHub Archive?</p>
+    <p class="error"><b>This only removes it from this archive.</b> It does NOT delete the repository on GitHub.</p>
+    <label class="toggle"><input type="checkbox" id="deleteRepoFiles"><span><b>Delete all downloaded files</b><br><small>Permanently remove all archived releases, source files, artifacts and other downloaded data for this repository.</small></span></label>
+    <label class="toggle"><input type="checkbox" id="deleteRepoConfirm"><span><b>I understand this action cannot be undone.</b></span></label>
+    <div class="modal-actions">
+      <button data-click="document.getElementById('deleteRepoModal').remove()">Cancel</button>
+      <button class="primary" data-click="confirmDeleteRepo(${id})">Delete Repository</button>
+    </div>
+  </div></div>`);
+}
+async function confirmDeleteRepo(id){
+  const confirmBox=document.getElementById('deleteRepoConfirm');
+  if(!confirmBox?.checked){alert('Please confirm that you understand this action cannot be undone.');return;}
+  const deleteFiles=!!document.getElementById('deleteRepoFiles')?.checked;
+  try{
+    const r=await api('/api/repos/'+id,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({delete_files:deleteFiles})});
+    document.getElementById('deleteRepoModal')?.remove();
+    alert(deleteFiles?'Repository removed and all downloaded files were deleted.':'Repository removed. Downloaded files were preserved on disk.');
+    await page('repos');
+  }catch(e){alert(e.message)}
+}
 
 async function versionPage(id){
   try { let d=await api('/api/versions/'+id),v=d.version; $('app').innerHTML='<div class="toolbar"><button data-click="repoPage('+v.repo_id+')">← Versions</button></div><div class="grid"><div class="stat">Version<b>'+esc(v.version)+'</b></div><div class="stat">Repository<b><a href="https://github.com/'+esc(v.full_name)+'" target="_blank">'+esc(v.full_name)+'</a></b></div></div><div class="card"><h3>Files</h3><table><thead><tr><th>Category</th><th>Name</th><th>Status</th><th>Size</th></tr></thead><tbody>'+d.files.map(f=>'<tr><td>'+esc(f.category)+'</td><td>'+esc(f.name)+'</td><td><span class="status '+f.status+'">'+f.status+'</span>'+(f.error?'<br><small class="error">'+esc(f.error)+'</small>':'')+'</td><td>'+bytes(f.size||0)+'</td></tr>').join('')+'</tbody></table></div>';} catch(e){ $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
@@ -165,6 +190,7 @@ async function runAction(code,e){
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
   if((m=code.match(/^checkOne\((\d+)\)$/))) return checkOne(Number(m[1]));
   if((m=code.match(/^delRepo\((\d+)\)$/))) return delRepo(Number(m[1]));
+  if((m=code.match(/^confirmDeleteRepo\((\d+)\)$/))) return confirmDeleteRepo(Number(m[1]));
   if((m=code.match(/^savePolicy\((\d+)\)$/))) return savePolicy(Number(m[1]));
   if((m=code.match(/^versionPage\((\d+)\)$/))) return versionPage(Number(m[1]));
   if((m=code.match(/^retry\((\d+)\)$/))) return retry(Number(m[1]));
