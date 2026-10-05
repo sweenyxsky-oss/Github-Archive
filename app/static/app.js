@@ -11,6 +11,18 @@ function repoRows(rs){return '<table><thead><tr><th>Repository</th><th>Group</th
 async function loadActivity(){let a=await api('/api/activity');$('activity').innerHTML=a.length?'<table><thead><tr><th>Time</th><th>Repository</th><th>Item</th><th>Status</th></tr></thead><tbody>'+a.slice(0,30).map(x=>'<tr><td>'+fmt(x.timestamp)+'</td><td>'+esc(x.full_name)+'</td><td>'+esc(x.version||'')+'</td><td class="'+esc(x.status)+'">'+esc(x.status)+'</td></tr>').join('')+'</tbody></table>':'<p class="muted">No activity yet.</p>'}
 function reposPage(){$('app').innerHTML='<h2>Repositories</h2><div class="toolbar"><input id="rq" placeholder="Search repositories..." data-input="filterRepos()"><button data-click="addRepo()">Add Repository</button><button data-click="addUser()">Add User</button></div><div id="rtable">'+repoRows(repos)+'</div>'}
 function filterRepos(){let q=$('rq').value.toLowerCase();$('rtable').innerHTML=repoRows(repos.filter(r=>(r.full_name+' '+(r.group_name||'')).toLowerCase().includes(q)))}
+async function addUser(){
+  const username=prompt("GitHub username (for example octocat):");
+  if(username===null)return;
+  const clean=username.trim().replace(/^@/,"");
+  if(!clean)return;
+  const archiveAll=confirm("Archive ALL existing releases for every repository owned by this user?\n\nOK = historical import\nCancel = monitor from now");
+  try{
+    const r=await api('/api/users/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:clean,archive_all:archiveAll})});
+    alert("Imported "+r.count+" repositories. Downloads have been queued in the background.");
+    await page('repos');
+  }catch(e){alert(e.message)}
+}
 async function addRepo(){
   document.body.insertAdjacentHTML('beforeend',`<div class="modal-backdrop" id="addRepoModal"><div class="modal">
     <h3>Add repository</h3><p class="muted">Start tracking a GitHub repository.</p>
