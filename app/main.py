@@ -235,7 +235,7 @@ async def create_manifest(repo,version,info,include_current=True):
     c=db()
     if policy.get("assets",True) and version["kind"]=="release":
         for a in info.get("assets",[]):
-            name=safe_name(a["name"]); upsert_file(c,version["id"],"release",name,str(Path("release")/name),a["browser_download_url"],a.get("size"),a.get("digest"))
+            name=safe_name(a["name"]); asset_url=f"https://api.github.com/repos/{repo['full_name']}/releases/assets/{a['id']}"; upsert_file(c,version["id"],"release",name,str(Path("release")/name),asset_url,a.get("size"),a.get("digest"))
     if policy.get("source",True):
         n=f"{safe_name(repo['name'])}-{safe_name(version['tag_name'])}-source.zip"
         upsert_file(c,version["id"],"source",n,str(Path("source")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['tag_name'],safe='')}")
@@ -277,6 +277,8 @@ async def download_one(f):
             try:
                 start=part.stat().st_size if part.exists() else 0
                 headers=gh_headers()
+                if "/releases/assets/" in f["source_url"]:
+                    headers["Accept"]="application/octet-stream"
                 if start: headers["Range"]=f"bytes={start}-"
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120,connect=30),follow_redirects=False) as client:
                     async with client.stream("GET",f["source_url"],headers=headers) as r:
