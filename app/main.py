@@ -12,7 +12,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
@@ -24,8 +24,18 @@ MAX_RETRIES = max(1, int(os.getenv("MAX_DOWNLOAD_RETRIES", "4")))
 WORKERS = max(1, int(os.getenv("DOWNLOAD_WORKERS", "2")))
 TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 app = FastAPI(title="GitHub Archive", version="2.0.0")
+
+@app.middleware("http")
+async def admin_auth(request:Request, call_next):
+    if ADMIN_TOKEN and request.url.path.startswith("/api/") and request.url.path != "/api/webhook":
+        auth=request.headers.get("authorization","")
+        supplied=auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-archive-token","").strip()
+        if not supplied or not hmac.compare_digest(supplied,ADMIN_TOKEN):
+            return JSONResponse({"detail":"Admin authentication required"},status_code=401)
+    return await call_next(request)
 check_lock = asyncio.Lock()
 background_task = None
 worker_tasks = []
@@ -591,7 +601,7 @@ async def health(): return {"ok":True,"version":"2.0.0","workers":WORKERS}
 @app.get("/api/settings")
 async def settings():
     c=db(); s=settings_map(c); c.close()
-    return {"check_interval_minutes":int(s.get("check_interval_minutes",DEFAULT_INTERVAL)),"include_prereleases":s.get("include_prereleases","false")=="true","token_configured":bool(TOKEN),"webhook_configured":bool(WEBHOOK_SECRET),"workers":WORKERS}
+    return {"check_interval_minutes":int(s.get("check_interval_minutes",DEFAULT_INTERVAL)),"include_prereleases":s.get("include_prereleases","false")=="true","token_configured":bool(TOKEN),"webhook_configured":bool(WEBHOOK_SECRET),"admin_auth_configured":bool(ADMIN_TOKEN),"workers":WORKERS}
 
 @app.put("/api/settings")
 async def update_settings(body:SettingsIn):
