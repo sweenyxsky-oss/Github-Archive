@@ -105,9 +105,10 @@ async def gh_json(client,url):
             r=await client.get(url,headers=gh_headers())
             if r.status_code < 400: return r.json()
             last=RuntimeError(f"GitHub API {r.status_code}: {r.text[:500]}")
-            if r.status_code not in (429,500,502,503,504): raise last
-            retry_after=r.headers.get("Retry-After")
-            delay=float(retry_after) if retry_after and retry_after.replace(".","",1).isdigit() else min(8,2**attempt)
+            rate_limited = r.status_code==403 and r.headers.get("X-RateLimit-Remaining")=="0"
+            if r.status_code not in (429,500,502,503,504) and not rate_limited: raise last
+            retry_after=r.headers.get("Retry-After") or r.headers.get("X-RateLimit-Reset")
+            delay=min(60,float(retry_after)-datetime.now(timezone.utc).timestamp()) if retry_after and retry_after.replace(".","",1).isdigit() and float(retry_after)>datetime.now(timezone.utc).timestamp() else min(8,2**attempt)
             await asyncio.sleep(delay)
         except (httpx.TimeoutException,httpx.NetworkError) as e:
             last=e
