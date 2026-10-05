@@ -201,6 +201,9 @@ async def list_actions_artifacts(repo, head_sha):
 async def create_manifest(repo,version,info,include_current=True):
     policy=policy_for(repo); base,release,source,current,actions,commits=repo_dirs(repo["full_name"],version["version"])
     for d in (release,source,current,actions,commits): d.mkdir(parents=True,exist_ok=True)
+    artifact_items=[]
+    if policy.get("artifacts",False) and version["target_sha"]:
+        artifact_items=await list_actions_artifacts(repo["full_name"],version["target_sha"])
     c=db()
     if policy.get("assets",True) and version["kind"]=="release":
         for a in info.get("assets",[]):
@@ -212,7 +215,7 @@ async def create_manifest(repo,version,info,include_current=True):
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
         upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
     if policy.get("artifacts",False) and version["target_sha"]:
-        for a in await list_actions_artifacts(repo["full_name"],version["target_sha"]):
+        for a in artifact_items:
             name=f"{safe_name(a.get('name') or 'artifact')}-{a.get('id')}.zip"
             upsert_file(c,version["id"],"actions",name,str(Path("actions")/name),
                         a["archive_download_url"],a.get("size_in_bytes"),a.get("digest"))
