@@ -502,6 +502,30 @@ async def refresh_version_statuses():
         c.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
     c.commit(); c.close()
 
+async def refresh_repo_statuses():
+    c=db()
+    rows=c.execute("SELECT id FROM repos").fetchall()
+    for r in rows:
+        total=c.execute("""SELECT COUNT(*) n FROM files f
+                           JOIN versions v ON v.id=f.version_id
+                           WHERE v.repo_id=?""",(r["id"],)).fetchone()["n"]
+        done=c.execute("""SELECT COUNT(*) n FROM files f
+                          JOIN versions v ON v.id=f.version_id
+                          WHERE v.repo_id=? AND f.status='complete'""",(r["id"],)).fetchone()["n"]
+        failed=c.execute("""SELECT COUNT(*) n FROM files f
+                            JOIN versions v ON v.id=f.version_id
+                            WHERE v.repo_id=? AND f.status='failed'""",(r["id"],)).fetchone()["n"]
+        if total and done==total:
+            status="complete"
+        elif failed:
+            status="failed"
+        elif total:
+            status="queued"
+        else:
+            status=c.execute("SELECT status FROM repos WHERE id=?",(r["id"],)).fetchone()["status"]
+        c.execute("UPDATE repos SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
+    c.commit(); c.close()
+
 async def scheduler():
     await asyncio.sleep(5)
     while True:
@@ -517,6 +541,7 @@ async def scheduler():
                     try: await check_repo(r["id"])
                     except Exception: pass
             await refresh_version_statuses()
+            await refresh_repo_statuses()
         except Exception: pass
         await asyncio.sleep(60)
 
