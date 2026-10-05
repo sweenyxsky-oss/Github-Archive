@@ -784,9 +784,21 @@ async def archive_list(path:str=""):
 
 @app.get("/download/{file_id}")
 async def download(file_id:int):
-    f=await file_repo(file_id); base=repo_dirs(f["full_name"],f["version"])[0]; p=(base/f["relative_path"]).resolve()
-    if not str(p).startswith(str(base.resolve())+os.sep) or not p.is_file(): raise HTTPException(404,"Archived file is not available")
+    f=await file_repo(file_id)
+    base=repo_dirs(f["full_name"],f["version"])[0].resolve()
+    p=(base/f["relative_path"]).resolve()
+    try: p.relative_to(base)
+    except ValueError: raise HTTPException(404,"Archived file is not available")
+    if p.is_symlink() or not p.is_file(): raise HTTPException(404,"Archived file is not available")
     return FileResponse(p,filename=p.name)
+
+@app.get("/download/path/{path:path}")
+async def download_path(path:str):
+    target=(DATA_DIR/path).resolve()
+    try: target.relative_to(REPOS_DIR.resolve())
+    except ValueError: raise HTTPException(400,"Invalid archive path")
+    if target.is_symlink() or not target.is_file(): raise HTTPException(404,"Archived file is not available")
+    return FileResponse(target,filename=target.name)
 
 @app.post("/api/webhook")
 async def webhook(request:Request):
