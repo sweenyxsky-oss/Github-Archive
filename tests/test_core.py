@@ -19,6 +19,11 @@ class CoreTests(unittest.TestCase):
                 main.parse_repo_url(value)
 
     def test_frontend_static_and_empty_repos_api(self):
+        c=main.db()
+        c.execute("DELETE FROM repos")
+        c.execute("DELETE FROM groups")
+        c.commit()
+        c.close()
         with TestClient(main.app) as client:
             static = client.get("/static/app.js")
             self.assertEqual(static.status_code, 200)
