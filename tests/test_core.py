@@ -34,7 +34,9 @@ class CoreTests(unittest.TestCase):
 
     def test_rate_state_detects_authenticated_headers(self):
         original = main.api_rate_state.copy()
+        original_token = main.TOKEN
         try:
+            main.TOKEN = "test-token"
             main._update_rate_state({
                 "X-RateLimit-Limit": "5000",
                 "X-RateLimit-Remaining": "4997",
@@ -49,6 +51,7 @@ class CoreTests(unittest.TestCase):
             self.assertIsNotNone(status["reset_at"])
         finally:
             main.api_rate_state = original
+            main.TOKEN = original_token
 
     def test_rate_state_warns_when_token_missing(self):
         original = main.TOKEN
