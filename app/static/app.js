@@ -2,7 +2,14 @@ let repos=[],groups=[],state={page:'dashboard',repo:null},adminToken=sessionStor
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=s=>s?new Date(s).toLocaleString():'—';
-const bytes=n=>{n=Number(n||0);if(n===0)return'0 B';const k=1024,sizes=['B','KB','MB','GB'];let i=Math.floor(Math.log(n)/Math.log(k));return(n/Math.pow(k,i)).toFixed(2)+' '+sizes[i]};
+const bytes=n=>{n=Number(n||0);if(n===0)return'0 B';const k=1024,sizes=['B','KB','MB','GB'];let i=Math.floor(Math.log(n)/Math.log(k));return(n/Math.pow(k,i)).toFixed(2)+' '+sizes[Math.min(i,sizes.length-1)]};
+const duration=s=>{s=Number(s||0);if(!s)return'—';s=Math.round(s);const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);const sec=s%60;return h?h+'h '+m+'m':m?m+'m '+sec+'s':sec+'s'};
+const PAGE_OPTIONS=[10,25,50];
+const pageSizes={dashboard:Number(sessionStorage.getItem('pageSize_dashboard')||10),repos:Number(sessionStorage.getItem('pageSize_repos')||10),queue:Number(sessionStorage.getItem('pageSize_queue')||10),browser:Number(sessionStorage.getItem('pageSize_browser')||10),storage:Number(sessionStorage.getItem('pageSize_storage')||10)};
+function pageSize(page){return pageSizes[page]||10}
+function pageSizeControl(page,fn){return '<label class="pager-size">Items per page <select data-change="'+fn+'(this.value)">'+PAGE_OPTIONS.map(n=>'<option value="'+n+'" '+(pageSize(page)===n?'selected':'')+'>'+n+'</option>').join('')+'</select></label>'}
+function setPageSize(page,value){pageSizes[page]=Number(value);sessionStorage.setItem('pageSize_'+page,String(pageSizes[page]));}
+function pager(page,current,total,prevFn,nextFn){const n=pageSize(page),pages=Math.max(1,Math.ceil(total/n));return '<div class="pager">'+pageSizeControl(page,'set'+page.charAt(0).toUpperCase()+page.slice(1)+'PageSize')+'<span>Showing '+(total?(current*n+1):0)+'–'+Math.min((current+1)*n,total)+' of '+total+'</span><span><button data-click="'+prevFn+'()" '+(current<=0?'disabled':'')+'>Previous</button><button data-click="'+nextFn+'()" '+(current>=pages-1?'disabled':'')+'>Next</button></span></div>'}
 
 async function api(u,o={},retry=true){
   const opts={...o,headers:new Headers(o.headers||{})};
@@ -60,15 +67,8 @@ async function page(p){
   }
 }
 
-function dashboard(){
-  const app=$('app');
-  if(!app) return;
-  let total=repos.reduce((a,r)=>a+Number(r.archive_size||0),0),failed=repos.reduce((a,r)=>a+Number(r.failed_files||0),0);
-  app.innerHTML='<h2>Dashboard</h2><div class="grid"><div class="stat">Total archived<b>'+bytes(total)+'</b></div><div class="stat">Repositories<b>'+repos.length+'</b></div><div class="stat">Failed files<b>'+failed+'</b></div></div><div id="githubRate" class="card"><p class="muted">Checking GitHub API rate limit…</p></div><div id="activity" class="card"><p class="muted">Loading activity…</p></div>';
-  loadRateLimit();
-  loadActivity();
-}
-
+let dashPageNumber=0,dashActivity=[];
+function dashboard(){const app=$('app');if(!app)return;let total=repos.reduce((a,r)=>a+Number(r.archive_size||0),0),failed=repos.reduce((a,r)=>a+Number(r.failed_files||0),0);app.innerHTML='<h2>Dashboard</h2><div class="grid"><div class="stat">Total archived<b>'+bytes(total)+'</b></div><div class="stat">Repositories<b>'+repos.length+'</b></div><div class="stat">Failed files<b>'+failed+'</b></div></div><div id="githubRate" class="card"><p class="muted">Checking GitHub API rate limit…</p></div><div id="activity" class="card"><p class="muted">Loading activity…</p></div>';loadRateLimit();loadActivity();}
 async function loadRateLimit(){
   const box=$('githubRate');
   if(!box)return;
@@ -87,27 +87,21 @@ async function loadRateLimit(){
   }
 }
 
-async function loadActivity(){
-  const activity=$('activity');
-  if(!activity) return;
-  try{
-    let a=await api('/api/activity');
-    activity.innerHTML=a.length?'<table><thead><tr><th>Time</th><th>Repository</th><th>Item</th><th>Status</th></tr></thead><tbody>'+a.map(x=>'<tr><td>'+fmt(x.timestamp)+'</td><td>'+esc(x.full_name)+'</td><td>'+esc(x.version||x.name)+'</td><td><span class="status '+x.status+'">'+x.status+'</span></td></tr>').join('')+'</tbody></table>':'<p class="muted">No activity yet.</p>';
-  } catch(e){
-    activity.innerHTML='<p class="error">Failed to load activity</p>';
-  }
-}
-
+async function loadActivity(){const box=$('activity');if(!box)return;try{dashActivity=await api('/api/activity');const n=pageSize('dashboard'),start=dashPageNumber*n,shown=dashActivity.slice(start,start+n);box.innerHTML='<h3>Latest Activity</h3><table><thead><tr><th>Time</th><th>Repository</th><th>Item</th><th>Status</th></tr></thead><tbody>'+(shown.length?shown.map(x=>'<tr><td>'+fmt(x.timestamp)+'</td><td>'+esc(x.full_name)+'</td><td>'+esc(x.version||x.name)+'</td><td><span class="status '+x.status+'">'+x.status+'</span></td></tr>').join(''):'<tr><td colspan="4" class="empty">No activity yet.</td></tr>')+'</tbody></table>'+pager('dashboard',dashPageNumber,dashActivity.length,'dashPrev','dashNext')}catch(e){box.innerHTML='<p class="error">Failed to load activity</p>';}}
+function dashPrev(){if(dashPageNumber>0){dashPageNumber--;loadActivity()}}
+function dashNext(){if(dashPageNumber<Math.ceil(dashActivity.length/pageSize('dashboard'))-1){dashPageNumber++;loadActivity()}}
+function setDashboardPageSize(v){setPageSize('dashboard',v);dashPageNumber=0;loadActivity()}
+function setReposPageSize(v){setPageSize('repos',v);repoPageNumber=0;renderRepoList()}
 let repoPageNumber=1;
-const REPOS_PER_PAGE=10;
+const REPOS_PER_PAGE=()=>pageSize('repos');
 let repoSearchTerm='';
 function reposPage(){const app=$('app'); if(!app) return; repoPageNumber=1; repoSearchTerm=''; app.innerHTML='<h2>Repositories</h2><div class="toolbar"><input id="rq" placeholder="Search repositories..." data-input="filterRepos()"><button data-click="addRepo()">Add Repository</button><button data-click="addUser()">Import User</button><button data-click="checkAll()">Check All</button></div><div id="rtable" class="card">'+repoRows(repos)+'</div>'}
 function sortedRepos(rs){return [...rs].sort((a,b)=>{const ad=Date.parse(a.created_at||'')||0,bd=Date.parse(b.created_at||'')||0;return bd-ad})}
 function repoRows(rs){
-  const total=rs.length, pages=Math.max(1,Math.ceil(total/REPOS_PER_PAGE)); if(repoPageNumber>pages)repoPageNumber=pages;
-  const start=(repoPageNumber-1)*REPOS_PER_PAGE, shown=sortedRepos(rs).slice(start,start+REPOS_PER_PAGE);
+  const total=rs.length, pages=Math.max(1,Math.ceil(total/REPOS_PER_PAGE())); if(repoPageNumber>pages)repoPageNumber=pages;
+  const start=(repoPageNumber-1)*REPOS_PER_PAGE(), shown=sortedRepos(rs).slice(start,start+REPOS_PER_PAGE());
   const rows=shown.map(r=>'<tr><td><a href="https://github.com/'+esc(r.full_name)+'" target="_blank">'+esc(r.full_name)+'</a></td><td>'+(r.group_name||'—')+'</td><td>'+esc(r.latest_version||'—')+'</td><td>'+fmt(r.latest_date)+'</td><td>'+r.version_count+'</td><td>'+bytes(r.archive_size||0)+'</td><td><span class="status '+r.status+'">'+r.status+'</span>'+(r.error?'<br><small class="error">'+esc(r.error)+'</small>':'')+'</td><td><label class="toggle"><input type="checkbox" data-change="setMonitoring('+r.id+',this.checked)" '+(r.monitoring?'checked':'')+'><span></span></label></td><td>'+(r.status==='failed'?'<button data-click="retryRepo('+r.id+')">Retry</button> ':'')+'<button data-click="repoPage('+r.id+')">…</button></td></tr>').join('');
-  return '<div class="table-wrap"><table><thead><tr><th>Repository</th><th>Group</th><th>Latest</th><th>Latest Added Date</th><th>Versions</th><th>Size</th><th>Status</th><th>Monitoring</th><th></th></tr></thead><tbody>'+rows+'</tbody></table><div class="pager"><span>Showing '+(total?start+1:0)+'–'+Math.min(start+REPOS_PER_PAGE,total)+' of '+total+'</span><span><button data-click="repoPrev()">Previous</button><button data-click="repoNext()">Next</button></span></div></div>'
+  return '<div class="table-wrap"><table><thead><tr><th>Repository</th><th>Group</th><th>Latest</th><th>Latest Added Date</th><th>Versions</th><th>Size</th><th>Status</th><th>Monitoring</th><th></th></tr></thead><tbody>'+rows+'</tbody></table><div class="pager"><span>Showing '+(total?start+1:0)+'–'+Math.min(start+REPOS_PER_PAGE(),total)+' of '+total+'</span><span><button data-click="repoPrev()">Previous</button><button data-click="repoNext()">Next</button></span></div></div>'
 }
 function renderRepoList(){const box=$('rtable');if(box)box.innerHTML=repoRows(sortedRepos(repos.filter(r=>(r.full_name+' '+(r.group_name||'')).toLowerCase().includes(repoSearchTerm))))}
 function filterRepos(){repoSearchTerm=($('rq')?.value||'').toLowerCase();repoPageNumber=1;renderRepoList()}
@@ -158,19 +152,26 @@ async function versionPage(id){
   try { let d=await api('/api/versions/'+id),v=d.version; $('app').innerHTML='<div class="toolbar"><button data-click="repoPage('+v.repo_id+')">← Versions</button></div><div class="grid"><div class="stat">Version<b>'+esc(v.version)+'</b></div><div class="stat">Repository<b><a href="https://github.com/'+esc(v.full_name)+'" target="_blank">'+esc(v.full_name)+'</a></b></div></div><div class="card"><h3>Files</h3><table><thead><tr><th>Category</th><th>Name</th><th>Status</th><th>Size</th></tr></thead><tbody>'+d.files.map(f=>'<tr><td>'+esc(f.category)+'</td><td>'+esc(f.name)+'</td><td><span class="status '+f.status+'">'+f.status+'</span>'+(f.error?'<br><small class="error">'+esc(f.error)+'</small>':'')+'</td><td>'+bytes(f.size||0)+'</td></tr>').join('')+'</tbody></table></div>';} catch(e){ $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
 }
 
-async function queuePage(){
-  try { let q=await api('/api/queue'); let s=await api('/api/settings'); $('app').innerHTML='<h2>Download Queue</h2><div class="card"><p class="muted">Downloads run with a persistent queue and '+s.check_interval_minutes+' minute interval checks.</p><table><thead><tr><th>Repository</th><th>File</th><th>Category</th><th>Status</th><th>Attempts</th><th></th></tr></thead><tbody>'+(q.length?q.map(i=>'<tr><td>'+esc(i.full_name)+'</td><td>'+esc(i.name)+'</td><td>'+i.category+'</td><td><span class="status '+i.status+'">'+i.file_status+'</span>'+(i.error?'<br><small class="error">'+esc(i.error)+'</small>':'')+'</td><td>'+i.attempts+'</td><td>'+(i.file_status==='failed'?'<button data-click="retry('+i.queue_id+')">Retry</button>':'')+'</td></tr>').join(''):'<tr><td colspan="6" class="empty">Queue is empty.</td></tr>')+'</tbody></table></div>';} catch(e){ $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
-}
+let queuePageNumber=0,queueSearchTerm='';
+async function queuePage(){try{let q=await api('/api/queue'),s=await api('/api/settings');window.queueData=q;const filtered=q.filter(i=>(i.full_name+' '+i.name+' '+i.category+' '+i.file_status).toLowerCase().includes(queueSearchTerm));const n=pageSize('queue'),start=queuePageNumber*n,shown=filtered.slice(start,start+n);$('app').innerHTML='<h2>Download Queue</h2><div class="toolbar"><input id="qq" placeholder="Search queue..." value="'+esc(queueSearchTerm)+'" data-input="filterQueue()"></div><div class="card"><p class="muted">Downloads run with a persistent queue and '+s.check_interval_minutes+' minute interval checks.</p><table><thead><tr><th>Repository</th><th>File</th><th>Category</th><th>Status</th><th>Progress</th><th>Speed</th><th>ETA</th><th>Attempts</th><th></th></tr></thead><tbody>'+(shown.length?shown.map(i=>{const pct=i.expected_size?Math.min(100,(Number(i.progress_bytes||0)/Number(i.expected_size))*100):null;const prog=pct==null?(i.file_status==='complete'?'100%':'—'):pct.toFixed(1)+'%';return '<tr><td>'+esc(i.full_name)+'</td><td>'+esc(i.name)+'</td><td>'+i.category+'</td><td><span class="status '+i.file_status+'">'+(i.file_status==='downloading'?prog:i.file_status)+'</span>'+(i.error?'<br><small class="error">'+esc(i.error)+'</small>':'')+'</td><td>'+prog+'</td><td>'+((i.speed_bps||0)>0?bytes(i.speed_bps)+'/s':'—')+'</td><td>'+duration(i.eta_seconds)+'</td><td>'+i.attempts+'</td><td>'+(i.file_status==='failed'?'<button data-click="retry('+i.queue_id+')">Retry</button>':'')+'</td></tr>'}).join(''):'<tr><td colspan="9" class="empty">Queue is empty.</td></tr>')+'</tbody></table>'+pager('queue',queuePageNumber,filtered.length,'queuePrev','queueNext')+'</div>';}catch(e){$('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>';}}
+function filterQueue(){queueSearchTerm=($('qq')?.value||'').toLowerCase();queuePageNumber=0;queuePage()}
+function queuePrev(){if(queuePageNumber>0){queuePageNumber--;queuePage()}}
+function queueNext(){const n=pageSize('queue'),total=(window.queueData||[]).filter(i=>(i.full_name+' '+i.name+' '+i.category+' '+i.file_status).toLowerCase().includes(queueSearchTerm)).length;if(queuePageNumber<Math.ceil(total/n)-1){queuePageNumber++;queuePage()}}
+function setQueuePageSize(v){setPageSize('queue',v);queuePageNumber=0;queuePage()}
 
 async function retry(id){try{await api('/api/queue/'+id+'/retry',{method:'POST'});await queuePage()}catch(e){alert(e.message)}}
 
-async function browserPage(path='repos'){
-  try { let d=await api('/api/archive/list?path='+encodeURIComponent(path)); let parts=path.split('/').filter(Boolean); let crumbs='<button data-click="browserPage(\'repos\')">Archive</button>'; let built=''; for(const p of parts.slice(1)){ built+=('/'+p); crumbs+=' <span class="muted">/</span> <button data-click="browserPage(\'repos'+built.replaceAll("'","")+'\')">'+esc(p)+'</button>'; } $('app').innerHTML='<h2>Archive Browser</h2><div class="toolbar">'+crumbs+'</div><div class="card"><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th></th></tr></thead><tbody>'+(d.entries.length?d.entries.map(x=>x.directory?'<tr><td>📁 <b>'+esc(x.name)+'</b></td><td>Directory</td><td>—</td><td><button data-click="browserPage(\''+esc(x.path).replaceAll("'","")+'\')">Open</button></td></tr>':'<tr><td>📄 '+esc(x.name)+'</td><td>File</td><td>'+bytes(x.size)+'</td><td><a class="btn" href="/download/path/'+x.path.split('/').map(encodeURIComponent).join('/')+'">Download</a></td></tr>').join(''):'<tr><td colspan="4" class="empty">Empty directory.</td></tr>')+'</tbody></table></div>';} catch(e){ $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
-}
+let browserPageNumber=0,browserSearchTerm='',browserEntries=[];
+async function browserPage(path='repos'){try{let d=await api('/api/archive/list?path='+encodeURIComponent(path));browserEntries=d.entries;browserPageNumber=0;const parts=path.split('/').filter(Boolean);let crumbs='<button data-click="browserPage(\'repos\')">Archive</button>';let built='';for(const p of parts.slice(1)){built+=('/'+p);crumbs+=' <span class="muted">/</span> <button data-click="browserPage(\'repos'+built.replaceAll("'","")+'\')">'+esc(p)+'</button>';}renderBrowser(path,crumbs);}catch(e){$('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>';}}
+function renderBrowser(path,crumbs){const filtered=browserEntries.filter(x=>x.name.toLowerCase().includes(browserSearchTerm));const n=pageSize('browser'),start=browserPageNumber*n,shown=filtered.slice(start,start+n);$('app').innerHTML='<h2>Archive Browser</h2><div class="toolbar">'+crumbs+'<input id="bq" placeholder="Search current folder..." value="'+esc(browserSearchTerm)+'" data-input="filterBrowser()"></div><div class="card"><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th></th></tr></thead><tbody>'+(shown.length?shown.map(x=>x.directory?'<tr><td>📁 <b>'+esc(x.name)+'</b></td><td>Directory</td><td>—</td><td><button data-click="browserPage(\''+esc(x.path).replaceAll("'","")+'\')">Open</button></td></tr>':'<tr><td>📄 '+esc(x.name)+'</td><td>File</td><td>'+bytes(x.size)+'</td><td><a class="btn" href="/download/path/'+x.path.split('/').map(encodeURIComponent).join('/')+'">Download</a></td></tr>').join(''):'<tr><td colspan="4" class="empty">Empty directory.</td></tr>')+'</tbody></table>'+pager('browser',browserPageNumber,filtered.length,'browserPrev','browserNext')+'</div>';}
+function filterBrowser(){browserSearchTerm=($('bq')?.value||'').toLowerCase();browserPageNumber=0;renderBrowser(currentBrowserPath,browserCrumbs)}
+let currentBrowserPath='repos',browserCrumbs='';
 
-async function storagePage(){
-  try { let s=await api('/api/storage'),rs=await api('/api/storage/repos'); $('app').innerHTML='<h2>Storage</h2><div class="grid"><div class="stat">Total capacity<b>'+bytes(s.total_bytes)+'</b></div><div class="stat">Used<b>'+bytes(s.archive_bytes)+'</b></div><div class="stat">Free<b>'+bytes(s.free_bytes)+'</b></div></div><div class="card"><table><thead><tr><th>Repository</th><th>Versions</th><th>Size</th></tr></thead><tbody>'+rs.map(r=>'<tr><td>'+esc(r.full_name)+'</td><td>'+r.versions+'</td><td>'+bytes(r.size)+'</td></tr>').join('')+'</tbody></table></div>';} catch(e){ $('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>'; }
-}
+let storagePageNumber=0,storageRows=[];
+async function storagePage(){try{let s=await api('/api/storage'),rs=await api('/api/storage/repos');storageRows=rs;const n=pageSize('storage'),start=storagePageNumber*n,shown=rs.slice(start,start+n);$('app').innerHTML='<h2>Storage</h2><div class="grid"><div class="stat">Total capacity<b>'+bytes(s.total_bytes)+'</b></div><div class="stat">Used<b>'+bytes(s.archive_bytes)+'</b></div><div class="stat">Free<b>'+bytes(s.free_bytes)+'</b></div></div><div class="card"><table><thead><tr><th>Repository</th><th>Versions</th><th>Size</th></tr></thead><tbody>'+shown.map(r=>'<tr><td>'+esc(r.full_name)+'</td><td>'+r.versions+'</td><td>'+bytes(r.size)+'</td></tr>').join('')+'</tbody></table>'+pager('storage',storagePageNumber,rs.length,'storagePrev','storageNext')+'</div>';}catch(e){$('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>';}}
+function storagePrev(){if(storagePageNumber>0){storagePageNumber--;storagePage()}}
+function storageNext(){if(storagePageNumber<Math.ceil(storageRows.length/pageSize('storage'))-1){storagePageNumber++;storagePage()}}
+function setStoragePageSize(v){setPageSize('storage',v);storagePageNumber=0;storagePage()}
 
 async function integrityPage(){ $('app').innerHTML='<h2>Integrity Verification</h2><div class="card"><p>Recalculate SHA-256 for every completed archive file and compare it with GitHub\'s digest when available.</p><button data-click="verify()">Verify Everything</button><div id="vr"></div></div>'; }
 async function verify(){ try { $('vr').innerHTML='Checking…'; let r=await api('/api/verify'); $('vr').innerHTML='<h3>Result</h3><p class="complete">Verified: '+r.ok+'</p><p class="'+(r.failed?'failed':'complete')+'">Failed: '+r.failed+'</p><p class="muted">Checked '+r.checked+' files.</p>'; } catch(e){ $('vr').innerHTML='<p class="error">'+esc(e.message)+'</p>'; } }
@@ -196,12 +197,19 @@ async function runAction(code,e){
   if(code==="saveSettings()") return saveSettings();
   if(code==="submitAddRepo()") return submitAddRepo();
   if(code==="filterRepos()") return filterRepos();
+  if(code==="filterQueue()") return filterQueue();
+  if(code==="filterBrowser()") return filterBrowser();
   if(code==="document.getElementById('addRepoModal').remove()") return document.getElementById('addRepoModal')?.remove();
   let m;
   if((m=code.match(/^page\('([^']+)'\)$/))) return page(m[1]);
   if((m=code.match(/^browserPage\('([^']*)'\)$/))) return browserPage(m[1]);
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
   if((m=code.match(/^checkOne\((\d+)\)$/))) return checkOne(Number(m[1]));
+  if((m=code.match(/^setDashboardPageSize\((.*)\)$/))) return setDashboardPageSize(Number(m[1]));
+  if((m=code.match(/^setReposPageSize\((.*)\)$/))) return setReposPageSize(Number(m[1]));
+  if((m=code.match(/^setQueuePageSize\((.*)\)$/))) return setQueuePageSize(Number(m[1]));
+  if((m=code.match(/^setBrowserPageSize\((.*)\)$/))) return setBrowserPageSize(Number(m[1]));
+  if((m=code.match(/^setStoragePageSize\((.*)\)$/))) return setStoragePageSize(Number(m[1]));
   if((m=code.match(/^retryRepo\((\d+)\)$/))) return retryRepo(Number(m[1]));
   if((m=code.match(/^retryRepo\((\d+)\)$/))) return retryRepo(Number(m[1]));
   if((m=code.match(/^delRepo\((\d+)\)$/))) return delRepo(Number(m[1]));
