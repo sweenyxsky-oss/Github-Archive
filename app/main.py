@@ -86,7 +86,7 @@ def parse_repo_url(url):
     p=urlparse(url.strip())
     if p.scheme not in ("http","https") or p.netloc.lower()!="github.com": raise ValueError("Repository URL must be a github.com URL")
     parts=[x for x in p.path.split("/") if x]
-    if len(parts)<2: raise ValueError("Repository URL must look like https://github.com/owner/repository")
+    if len(parts)!=2: raise ValueError("Repository URL must look like https://github.com/owner/repository")
     owner,repo=parts[0],parts[1].removesuffix(".git")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+",owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+",repo): raise ValueError("Invalid GitHub repository name")
     return owner+"/"+repo
