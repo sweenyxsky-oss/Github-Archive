@@ -32,6 +32,35 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(repos.status_code, 200)
             self.assertEqual(repos.json(), [])
 
+    def test_rate_state_detects_authenticated_headers(self):
+        original = main.api_rate_state.copy()
+        try:
+            main._update_rate_state({
+                "X-RateLimit-Limit": "5000",
+                "X-RateLimit-Remaining": "4997",
+                "X-RateLimit-Reset": "2000000000",
+            })
+            status = main.github_rate_status()
+            self.assertTrue(status["authenticated"])
+            self.assertTrue(status["token_configured"] if main.TOKEN else not status["token_configured"])
+            self.assertEqual(status["limit"], 5000)
+            self.assertEqual(status["remaining"], 4997)
+            self.assertEqual(status["reset"], 2000000000)
+            self.assertIsNotNone(status["reset_at"])
+        finally:
+            main.api_rate_state = original
+
+    def test_rate_state_warns_when_token_missing(self):
+        original = main.TOKEN
+        try:
+            main.TOKEN = ""
+            status = main.github_rate_status()
+            self.assertFalse(status["authenticated"])
+            self.assertFalse(status["token_configured"])
+            self.assertIn("not configured", status["warning"])
+        finally:
+            main.TOKEN = original
+
     def test_safe_name(self):
         self.assertEqual(main.safe_name("hello world"), "hello_world")
         self.assertEqual(main.safe_name("a/b:c"), "a_b_c")
