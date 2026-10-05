@@ -58,6 +58,7 @@ Environment variables:
 - `DOWNLOAD_WORKERS` — concurrent download workers, default 2.
 
 - `WEBHOOK_SECRET` — optional HMAC secret for GitHub webhook verification.
+- `ADMIN_TOKEN` — optional dashboard/API bearer token. When set, management API endpoints require it; the webhook remains protected by `WEBHOOK_SECRET`.
 
 For private repositories, the GitHub token should have the repository Contents read permission; Actions artifact archiving also requires Actions read permission.
 - `TZ` — default Asia/Riyadh.
