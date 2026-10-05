@@ -130,12 +130,13 @@ def _update_rate_state(headers):
         "updated_at":now(),
     }
 
-async def _api_wait():
+async def _api_request(client,url):
     global api_next_request_at
     async with api_request_lock:
         delay=api_next_request_at-asyncio.get_running_loop().time()
         if delay>0: await asyncio.sleep(delay)
         api_next_request_at=asyncio.get_running_loop().time()+API_MIN_INTERVAL
+        return await client.get(url,headers=gh_headers())
 
 def github_rate_status():
     state=dict(api_rate_state)
@@ -156,8 +157,7 @@ async def gh_json(client,url):
     last=None
     for attempt in range(API_RETRIES):
         try:
-            await _api_wait()
-            r=await client.get(url,headers=gh_headers())
+            r=await _api_request(client,url)
             _update_rate_state(r.headers)
             if r.status_code < 400: return r.json()
 
