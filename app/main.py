@@ -377,10 +377,11 @@ async def list_repo_releases(full_name, include_prereleases=True):
             for rel in items:
                 if rel.get("draft"): continue
                 if rel.get("prerelease") and not include_prereleases: continue
+                sha=await resolve_tag_sha(client,full_name,rel["tag_name"])
                 releases.append({
                     "version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release",
                     "published_at":rel.get("published_at") or rel.get("created_at"),
-                    "html_url":rel["html_url"],"sha":None,"assets":rel.get("assets",[])
+                    "html_url":rel["html_url"],"sha":sha,"assets":rel.get("assets",[])
                 })
             if len(items)<100: break
             page+=1
