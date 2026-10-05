@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: github-archive-publish
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
