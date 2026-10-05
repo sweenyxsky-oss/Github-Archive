@@ -657,17 +657,47 @@ async def storage_repos():
 
 @app.get("/api/verify")
 async def verify_all():
-    c=db(); fs=c.execute("SELECT f.*,v.version,r.full_name FROM files f JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id WHERE f.status='complete'").fetchall(); c.close()
-    results=[]; ok=0
+    c=db()
+    fs=c.execute("""SELECT f.*,v.version,r.full_name
+                   FROM files f
+                   JOIN versions v ON v.id=f.version_id
+                   JOIN repos r ON r.id=v.repo_id
+                   WHERE f.status='complete'""").fetchall()
+    c.close()
+    results=[]
+    ok=0
     for f in fs:
-        base=repo_dirs(f["full_name"],f["version"])[0]; p=(base/f["relative_path"]).resolve()
-        if not p.is_file(): results.append({"id":f["id"],"ok":False,"error":"missing"}); continue
+        base=repo_dirs(f["full_name"],f["version"])[0].resolve()
+        p=(base/f["relative_path"]).resolve()
+        safe=False
+        try:
+            p.relative_to(base)
+            safe=True
+        except ValueError:
+            pass
+        if not safe or not p.is_file() or p.is_symlink():
+            c=db()
+            c.execute("UPDATE files SET verify_status='failed',error=? WHERE id=?",
+                      ("missing or invalid archived file",f["id"]))
+            c.commit(); c.close()
+            results.append({"id":f["id"],"ok":False,"error":"missing or invalid archived file"})
+            continue
         h=hashlib.sha256()
         with p.open("rb") as x:
-            for b in iter(lambda:x.read(1024*1024),b""): h.update(b)
-        good=(f["sha256"] is None or not f["sha256"].startswith("sha256:") or h.hexdigest().lower()==f["sha256"].split(":",1)[1].lower())
-        c=db(); c.execute("UPDATE files SET verify_status=? WHERE id=?",("verified" if good else "failed",f["id"])); c.commit(); c.close()
-        results.append({"id":f["id"],"ok":good,"sha256":h.hexdigest()}); ok+=good
+            for data in iter(lambda:x.read(1024*1024),b""): h.update(data)
+        actual=h.hexdigest()
+        if f["sha256"] and f["sha256"].startswith("sha256:"):
+            good=actual.lower()==f["sha256"].split(":",1)[1].lower()
+            verify_status="verified" if good else "failed"
+        else:
+            good=True
+            verify_status="verified-local"
+        c=db()
+        c.execute("UPDATE files SET verify_status=?,error=NULL WHERE id=?",
+                  (verify_status if good else "failed",f["id"]))
+        c.commit(); c.close()
+        results.append({"id":f["id"],"ok":good,"sha256":actual})
+        ok+=1 if good else 0
     return {"checked":len(results),"ok":ok,"failed":len(results)-ok,"results":results}
 
 @app.get("/api/search")
