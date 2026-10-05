@@ -211,13 +211,13 @@ async def create_manifest(repo,version,info,include_current=True):
     if include_current and policy.get("current",True):
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
         upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
-    if policy.get("artifacts",False) and version.get("target_sha"):
+    if policy.get("artifacts",False) and version["target_sha"]:
         for a in await list_actions_artifacts(repo["full_name"],version["target_sha"]):
             name=f"{safe_name(a.get('name') or 'artifact')}-{a.get('id')}.zip"
             upsert_file(c,version["id"],"actions",name,str(Path("actions")/name),
                         a["archive_download_url"],a.get("size_in_bytes"),a.get("digest"))
 
-    if policy.get("commits",False) and version.get("target_sha"):
+    if policy.get("commits",False) and version["target_sha"]:
         sha=version["target_sha"]
         name=f"commit-{safe_name(sha)}.zip"
         upsert_file(c,version["id"],"commits",name,str(Path("commits")/name),
