@@ -260,7 +260,9 @@ async def create_manifest(repo,version,info,include_current=True):
     meta={"repository":repo["full_name"],"version":version["version"],"tag":version["tag_name"],"kind":version["kind"],"target_sha":version["target_sha"],
           "default_branch":info["default_branch"],"published_at":version["published_at"],"release_url":version["html_url"],
           "archived_at":now(),"assets":[{"name":a.get("name"),"size":a.get("size"),"digest":a.get("digest"),"url":a.get("browser_download_url")} for a in info.get("assets",[])]}
-    (base/"metadata.json").write_text(json.dumps(meta,indent=2),encoding="utf-8")
+    meta_tmp=base/"metadata.json.part"
+    meta_tmp.write_text(json.dumps(meta,indent=2),encoding="utf-8")
+    meta_tmp.replace(base/"metadata.json")
     c.close(); return base
 
 async def download_one(f):
