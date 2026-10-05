@@ -205,6 +205,16 @@ async function runAction(code,e){
   if(code==="filterRepos()") return filterRepos();
   if(code==="filterQueue()") return filterQueue();
   if(code==="filterBrowser()") return filterBrowser();
+  if(code==="dashPrev()") return dashPrev();
+  if(code==="dashNext()") return dashNext();
+  if(code==="repoPrev()") return repoPrev();
+  if(code==="repoNext()") return repoNext();
+  if(code==="queuePrev()") return queuePrev();
+  if(code==="queueNext()") return queueNext();
+  if(code==="browserPrev()") return browserPrev();
+  if(code==="browserNext()") return browserNext();
+  if(code==="storagePrev()") return storagePrev();
+  if(code==="storageNext()") return storageNext();
   if(code==="document.getElementById('addRepoModal').remove()") return document.getElementById('addRepoModal')?.remove();
   let m;
   if((m=code.match(/^page\('([^']+)'\)$/))) return page(m[1]);
