@@ -47,7 +47,23 @@ async function delRepo(id){if(!confirm('Delete repository and its database recor
 async function versionPage(id){let d=await api('/api/versions/'+id),v=d.version;$('app').innerHTML='<div class="toolbar"><button data-click="repoPage('+v.repo_id+')">← Versions</button></div><div class="card"><h2>'+esc(v.repo_name)+' — '+esc(v.version)+'</h2><p><span class="'+esc(v.status)+'">'+esc(v.status)+'</span> · '+esc(v.kind)+' · '+fmt(v.published_at)+'</p><p class="muted">SHA: '+esc(v.target_sha||'not resolved by release API')+'</p></div><div class="card"><h3>Archived files</h3><table><thead><tr><th>Type</th><th>File</th><th>Size</th><th>Status</th><th>Verification</th><th></th></tr></thead><tbody>'+d.files.map(f=>'<tr><td>'+esc(f.category)+'</td><td>'+esc(f.name)+'</td><td>'+bytes(f.size||f.expected_size)+'</td><td class="'+esc(f.status)+'">'+esc(f.status)+(f.error?'<br><small>'+esc(f.error)+'</small>':'')+'</td><td class="'+esc(f.verify_status||'')+'">'+esc(f.verify_status||'unverified')+'</td><td>'+(f.status==='complete'?'<a class="btn" href="/download/'+f.id+'">Download</a>':'')+'</td></tr>').join('')+'</tbody></table></div>'}
 async function queuePage(){let q=await api('/api/queue');$('app').innerHTML='<h2>Download Queue</h2><div class="card"><p class="muted">Downloads run with a persistent queue and '+((await api('/api/settings')).workers)+' worker(s). Interrupted .part files resume automatically.</p></div><table><thead><tr><th>Time</th><th>Repository</th><th>Version</th><th>File</th><th>Status</th><th>Attempts</th><th></th></tr></thead><tbody>'+q.map(x=>'<tr><td>'+fmt(x.queued_at)+'</td><td>'+esc(x.full_name)+'</td><td>'+esc(x.version)+'</td><td>'+esc(x.name)+'</td><td class="'+esc(x.status)+'">'+esc(x.status)+'</td><td>'+x.attempts+'</td><td>'+(x.status==='failed'?'<button data-click="retry('+x.id+')">Retry</button>':'')+'</td></tr>').join('')+'</tbody></table>'}
 async function retry(id){await api('/api/queue/'+id+'/retry',{method:'POST'});queuePage()}
-async function browserPage(){$('app').innerHTML='<h2>Archive Browser</h2><div class="card"><p class="muted">Browse the archive from the web UI. The database-backed file list is used for direct downloads.</p></div>'+repoRows(repos)}
+async function browserPage(path='repos'){
+  let d=await api('/api/archive/list?path='+encodeURIComponent(path));
+  let parts=path.split('/').filter(Boolean);
+  let crumbs='<button data-click="browserPage(\'repos\')">Archive</button>';
+  let built='';
+  for(const p of parts.slice(1)){
+    built+=('/'+p);
+    crumbs+=' <span class="muted">/</span> <button data-click="browserPage(\'repos'+built.replaceAll("'","")+'\')">'+esc(p)+'</button>';
+  }
+  const parent=parts.length>1?parts.slice(0,-1).join('/'):null;
+  $('app').innerHTML='<h2>Archive Browser</h2><div class="toolbar">'+crumbs+'</div><div class="card"><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th></th></tr></thead><tbody>'+
+    (d.entries.length?d.entries.map(x=>x.directory
+      ? '<tr><td>📁 <b>'+esc(x.name)+'</b></td><td>Directory</td><td>—</td><td><button data-click="browserPage(\''+esc(x.path).replaceAll("'","")+'\')">Open</button></td></tr>'
+      : '<tr><td>📄 '+esc(x.name)+'</td><td>File</td><td>'+bytes(x.size)+'</td><td><a class="btn" href="/download/path/'+x.path.split('/').map(encodeURIComponent).join('/')+'">Download</a></td></tr>'
+    ).join(''):'<tr><td colspan="4" class="empty">Empty directory.</td></tr>')+
+    '</tbody></table></div>';
+}
 async function storagePage(){let s=await api('/api/storage'),rs=await api('/api/storage/repos');$('app').innerHTML='<h2>Storage</h2><div class="grid"><div class="stat">Total capacity<b>'+bytes(s.total_bytes)+'</b></div><div class="stat">Free<b>'+bytes(s.free_bytes)+'</b></div><div class="stat">Archive<b>'+bytes(s.archive_bytes)+'</b></div><div class="stat">Files<b>'+s.files+'</b></div></div><div class="card"><h3>Largest repositories</h3><table><thead><tr><th>Repository</th><th>Versions</th><th>Size</th></tr></thead><tbody>'+rs.map(x=>'<tr><td>'+esc(x.full_name)+'</td><td>'+x.versions+'</td><td>'+bytes(x.size)+'</td></tr>').join('')+'</tbody></table></div>'}
 async function integrityPage(){$('app').innerHTML='<h2>Integrity Verification</h2><div class="card"><p>Recalculate SHA-256 for every completed archive file and compare it with GitHub's digest when one is available.</p><button class="primary" data-click="verify()">Verify Everything</button><div id="vr"></div></div>'}
 async function verify(){$('vr').innerHTML='Checking…';let r=await api('/api/verify');$('vr').innerHTML='<h3>Result</h3><p class="complete">Verified: '+r.ok+'</p><p class="'+(r.failed?'failed':'complete')+'">Failed: '+r.failed+'</p>'}
@@ -72,6 +88,7 @@ async function runAction(code,e){
   if(code==="document.getElementById('addRepoModal').remove()") return document.getElementById('addRepoModal')?.remove();
   let m;
   if((m=code.match(/^page\('([^']+)'\)$/))) return page(m[1]);
+  if((m=code.match(/^browserPage\('([^']*)'\)$/))) return browserPage(m[1]);
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
   if((m=code.match(/^checkOne\((\d+)\)$/))) return checkOne(Number(m[1]));
   if((m=code.match(/^delRepo\((\d+)\)$/))) return delRepo(Number(m[1]));
