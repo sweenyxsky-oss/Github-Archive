@@ -179,7 +179,18 @@ def policy_for(repo):
     try: return json.loads(repo["policy"] or "{}")
     except Exception: return {"releases":True,"assets":True,"source":True,"current":True,"tags":True}
 def repo_dirs(full,version):
-    owner,name=full.split("/",1); base=REPOS_DIR/safe_name(owner)/safe_name(name)/safe_name(version)
+    owner,name=full.split("/",1)
+    root=REPOS_DIR/safe_name(owner)/safe_name(name)
+    legacy=root/safe_name(version)
+    hashed=root/(safe_name(version)+"-"+hashlib.sha256(version.encode("utf-8")).hexdigest()[:10])
+    base=hashed
+    if not hashed.exists() and legacy.exists():
+        meta=legacy/"metadata.json"
+        try:
+            if json.loads(meta.read_text(encoding="utf-8")).get("version")==version:
+                base=legacy
+        except (OSError,ValueError,TypeError):
+            pass
     return base,base/"release",base/"source",base/"repository-current",base/"actions",base/"commits"
 
 def upsert_version(c,repo,info):
