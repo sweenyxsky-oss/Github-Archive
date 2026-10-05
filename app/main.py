@@ -181,6 +181,23 @@ def upsert_file(c,vid,cat,name,rel,url,size=None,digest=None):
 def enqueue(c,fid):
     c.execute("INSERT OR IGNORE INTO queue(file_id,status,queued_at) VALUES(?,'queued',?)",(fid,now()))
 
+async def list_actions_artifacts(repo, head_sha):
+    if not head_sha: return []
+    artifacts=[]
+    async with httpx.AsyncClient(timeout=60) as client:
+        page=1
+        while True:
+            data=await gh_json(client,f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}")
+            items=data.get("artifacts",[])
+            if not items: break
+            for a in items:
+                run=a.get("workflow_run") or {}
+                if a.get("expired") or run.get("head_sha")!=head_sha: continue
+                artifacts.append(a)
+            if len(items)<100: break
+            page+=1
+    return artifacts
+
 async def create_manifest(repo,version,info,include_current=True):
     policy=policy_for(repo); base,release,source,current,actions,commits=repo_dirs(repo["full_name"],version["version"])
     for d in (release,source,current,actions,commits): d.mkdir(parents=True,exist_ok=True)
@@ -194,6 +211,18 @@ async def create_manifest(repo,version,info,include_current=True):
     if include_current and policy.get("current",True):
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
         upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
+    if policy.get("artifacts",False) and version.get("target_sha"):
+        for a in await list_actions_artifacts(repo["full_name"],version["target_sha"]):
+            name=f"{safe_name(a.get('name') or 'artifact')}-{a.get('id')}.zip"
+            upsert_file(c,version["id"],"actions",name,str(Path("actions")/name),
+                        a["archive_download_url"],a.get("size_in_bytes"),a.get("digest"))
+
+    if policy.get("commits",False) and version.get("target_sha"):
+        sha=version["target_sha"]
+        name=f"commit-{safe_name(sha)}.zip"
+        upsert_file(c,version["id"],"commits",name,str(Path("commits")/name),
+                    f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(sha,safe='')}")
+
     rows=c.execute("SELECT * FROM files WHERE version_id=?",(version["id"],)).fetchall()
     for f in rows: enqueue(c,f["id"])
     c.commit()
