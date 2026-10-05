@@ -201,6 +201,7 @@ async function runAction(code,e){
   if((m=code.match(/^browserPage\('([^']*)'\)$/))) return browserPage(m[1]);
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
   if((m=code.match(/^checkOne\((\d+)\)$/))) return checkOne(Number(m[1]));
+  if((m=code.match(/^retryRepo\((\d+)\)$/))) return retryRepo(Number(m[1]));
   if((m=code.match(/^delRepo\((\d+)\)$/))) return delRepo(Number(m[1]));
   if((m=code.match(/^confirmDeleteRepo\((\d+)\)$/))) return confirmDeleteRepo(Number(m[1]));
   if((m=code.match(/^savePolicy\((\d+)\)$/))) return savePolicy(Number(m[1]));
