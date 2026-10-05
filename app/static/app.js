@@ -64,8 +64,27 @@ function dashboard(){
   const app=$('app');
   if(!app) return;
   let total=repos.reduce((a,r)=>a+Number(r.archive_size||0),0),failed=repos.reduce((a,r)=>a+Number(r.failed_files||0),0);
-  app.innerHTML='<h2>Dashboard</h2><div class="grid"><div class="stat">Total archived<b>'+bytes(total)+'</b></div><div class="stat">Repositories<b>'+repos.length+'</b></div><div class="stat">Failed files<b>'+failed+'</b></div></div><div id="activity" class="card"><p class="muted">Loading activity…</p></div>';
+  app.innerHTML='<h2>Dashboard</h2><div class="grid"><div class="stat">Total archived<b>'+bytes(total)+'</b></div><div class="stat">Repositories<b>'+repos.length+'</b></div><div class="stat">Failed files<b>'+failed+'</b></div></div><div id="githubRate" class="card"><p class="muted">Checking GitHub API rate limit…</p></div><div id="activity" class="card"><p class="muted">Loading activity…</p></div>';
+  loadRateLimit();
   loadActivity();
+}
+
+async function loadRateLimit(){
+  const box=$('githubRate');
+  if(!box)return;
+  try{
+    const r=await api('/api/github/rate-limit');
+    if(!r.token_configured){
+      box.innerHTML='<p class="error"><b>GitHub API: Unauthenticated</b><br>GITHUB_TOKEN is not configured. GitHub API requests are subject to the low unauthenticated limit.</p>';
+      return;
+    }
+    const remaining=r.remaining==null?'—':Number(r.remaining).toLocaleString();
+    const limit=r.limit==null?'—':Number(r.limit).toLocaleString();
+    const reset=r.reset_at?fmt(r.reset_at):'—';
+    box.innerHTML='<p><b>GitHub API: Authenticated</b> — '+remaining+' / '+limit+' requests remaining</p><small class="muted">Rate-limit window resets: '+esc(reset)+'</small>';
+  }catch(e){
+    box.innerHTML='<p class="error">GitHub API rate-limit status unavailable: '+esc(e.message)+'</p>';
+  }
 }
 
 async function loadActivity(){
