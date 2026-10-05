@@ -358,6 +358,8 @@ async def download_one(f):
     progress_last_write=0.0
     progress_started=asyncio.get_running_loop().time()
     progress_base=0
+    speed_sample_time=progress_started
+    speed_sample_bytes=0
     base=repo_dirs(f["full_name"],f["version"])[0]
     target=(base/Path(f["relative_path"])).resolve()
     if not str(target).startswith(str(base.resolve())+os.sep):
@@ -387,12 +389,17 @@ async def download_one(f):
                                 with part.open("ab" if start and rr.status_code==206 else "wb") as out:
                                     async for chunk in rr.aiter_bytes(1024*1024):
                                         out.write(chunk)
-                                    progress_base += len(chunk)
-                                    tnow=asyncio.get_running_loop().time()
-                                    if tnow-progress_last_write>=0.75:
-                                        elapsed=max(0.001,tnow-progress_started); total_bytes=start+progress_base
-                                        speed=total_bytes/elapsed; eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
-                                        c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close(); progress_last_write=tnow
+                                        progress_base += len(chunk)
+                                        tnow=asyncio.get_running_loop().time()
+                                        if tnow-progress_last_write>=0.5:
+                                            total_bytes=start+progress_base
+                                            sample_elapsed=max(0.001,tnow-speed_sample_time)
+                                            speed=max(0,(total_bytes-speed_sample_bytes)/sample_elapsed)
+                                            eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
+                                            c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close()
+                                            progress_last_write=tnow
+                                            speed_sample_time=tnow
+                                            speed_sample_bytes=total_bytes
                         else:
                             if start and r.status_code==200: start=0; part.unlink(missing_ok=True)
                             if r.status_code==416: part.unlink(missing_ok=True); continue
@@ -400,12 +407,16 @@ async def download_one(f):
                             with part.open("ab" if start and r.status_code==206 else "wb") as out:
                                 async for chunk in r.aiter_bytes(1024*1024):
                                     out.write(chunk)
-                                progress_base += len(chunk)
-                                tnow=asyncio.get_running_loop().time()
-                                if tnow-progress_last_write>=0.75:
-                                    elapsed=max(0.001,tnow-progress_started); total_bytes=start+progress_base
-                                    speed=total_bytes/elapsed; eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
-                                    c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close(); progress_last_write=tnow
+                                    progress_base += len(chunk)
+                                    tnow=asyncio.get_running_loop().time()
+                                    if tnow-progress_last_write>=0.5:
+                                        total_bytes=start+progress_base
+                                        sample_elapsed=max(0.001,tnow-speed_sample_time)
+                                        speed=max(0,(total_bytes-speed_sample_bytes)/sample_elapsed)
+                                        eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
+                                        c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close()
+                                        progress_last_write=tnow
+                                        speed_sample_time=tnow
                 size=part.stat().st_size
                 if expected is not None and size!=expected: raise RuntimeError(f"Size mismatch: got {size}, expected {expected}")
                 h=hashlib.sha256()
@@ -667,6 +678,22 @@ async def refresh_repo_statuses():
         c.execute("UPDATE repos SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
     c.commit(); c.close()
 
+def scheduler_status():
+    c=db(); interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL)
+    rows=c.execute("SELECT id,full_name,last_checked_at FROM repos WHERE monitoring=1").fetchall(); c.close()
+    now_dt=datetime.now(timezone.utc); next_at=None; due_count=0
+    from datetime import timedelta
+    for r in rows:
+        due_at=now_dt
+        if r["last_checked_at"]:
+            try: due_at=datetime.fromisoformat(r["last_checked_at"])+timedelta(minutes=interval)
+            except ValueError: pass
+        if due_at<=now_dt: due_count+=1
+        if next_at is None or due_at<next_at: next_at=due_at
+    seconds=max(0,int((next_at-now_dt).total_seconds())) if next_at else None
+    return {"interval_minutes":interval,"monitoring_repos":len(rows),"due_now":due_count,
+            "next_check_at":next_at.isoformat() if next_at else None,"seconds_until_next":seconds}
+
 async def scheduler():
     await asyncio.sleep(5)
     while True:
@@ -719,6 +746,10 @@ async def shutdown():
 async def index(): return HTMLResponse((Path(__file__).parent/"static"/"index.html").read_text(encoding="utf-8"))
 @app.get("/health")
 async def health(): return {"ok":True,"version":"2.0.0","workers":WORKERS}
+
+@app.get("/api/scheduler/status")
+async def scheduler_status_api():
+    return scheduler_status()
 
 @app.get("/api/github/rate-limit")
 async def github_rate_limit():
