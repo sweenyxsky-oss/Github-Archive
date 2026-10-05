@@ -376,7 +376,7 @@ async def download_one(f):
                                 if rr.status_code>=400: raise RuntimeError(f"Download HTTP {rr.status_code}")
                                 with part.open("ab" if start and rr.status_code==206 else "wb") as out:
                                     async for chunk in rr.aiter_bytes(1024*1024):
-                                    out.write(chunk)
+                                        out.write(chunk)
                                     progress_base += len(chunk)
                                     tnow=asyncio.get_running_loop().time()
                                     if tnow-progress_last_write>=0.75:
@@ -389,7 +389,7 @@ async def download_one(f):
                             if r.status_code>=400: raise RuntimeError(f"Download HTTP {r.status_code}")
                             with part.open("ab" if start and r.status_code==206 else "wb") as out:
                                 async for chunk in r.aiter_bytes(1024*1024):
-                                out.write(chunk)
+                                    out.write(chunk)
                                 progress_base += len(chunk)
                                 tnow=asyncio.get_running_loop().time()
                                 if tnow-progress_last_write>=0.75:
