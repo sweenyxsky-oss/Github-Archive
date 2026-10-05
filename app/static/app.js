@@ -162,7 +162,7 @@ function setQueuePageSize(v){setPageSize('queue',v);queuePageNumber=0;queuePage(
 async function retry(id){try{await api('/api/queue/'+id+'/retry',{method:'POST'});await queuePage()}catch(e){alert(e.message)}}
 
 let browserPageNumber=0,browserSearchTerm='',browserEntries=[];
-async function browserPage(path='repos'){try{let d=await api('/api/archive/list?path='+encodeURIComponent(path));browserEntries=d.entries;browserPageNumber=0;const parts=path.split('/').filter(Boolean);let crumbs='<button data-click="browserPage(\'repos\')">Archive</button>';let built='';for(const p of parts.slice(1)){built+=('/'+p);crumbs+=' <span class="muted">/</span> <button data-click="browserPage(\'repos'+built.replaceAll("'","")+'\')">'+esc(p)+'</button>';}renderBrowser(path,crumbs);}catch(e){$('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>';}}
+async function browserPage(path='repos'){try{let d=await api('/api/archive/list?path='+encodeURIComponent(path));browserEntries=d.entries;browserPageNumber=0;browserSearchTerm='';currentBrowserPath=path;const parts=path.split('/').filter(Boolean);let crumbs='<button data-click="browserPage(\'repos\')">Archive</button>';let built='';for(const p of parts.slice(1)){built+=('/'+p);crumbs+=' <span class="muted">/</span> <button data-click="browserPage(\'repos'+built.replaceAll("'","")+'\')">'+esc(p)+'</button>';}renderBrowser(path,crumbs);}catch(e){$('app').innerHTML='<h2>Error</h2><p class="error">'+esc(e.message)+'</p>';}}
 function renderBrowser(path,crumbs){const filtered=browserEntries.filter(x=>x.name.toLowerCase().includes(browserSearchTerm));const n=pageSize('browser'),start=browserPageNumber*n,shown=filtered.slice(start,start+n);$('app').innerHTML='<h2>Archive Browser</h2><div class="toolbar">'+crumbs+'<input id="bq" placeholder="Search current folder..." value="'+esc(browserSearchTerm)+'" data-input="filterBrowser()"></div><div class="card"><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th></th></tr></thead><tbody>'+(shown.length?shown.map(x=>x.directory?'<tr><td>📁 <b>'+esc(x.name)+'</b></td><td>Directory</td><td>—</td><td><button data-click="browserPage(\''+esc(x.path).replaceAll("'","")+'\')">Open</button></td></tr>':'<tr><td>📄 '+esc(x.name)+'</td><td>File</td><td>'+bytes(x.size)+'</td><td><a class="btn" href="/download/path/'+x.path.split('/').map(encodeURIComponent).join('/')+'">Download</a></td></tr>').join(''):'<tr><td colspan="4" class="empty">Empty directory.</td></tr>')+'</tbody></table>'+pager('browser',browserPageNumber,filtered.length,'browserPrev','browserNext')+'</div>';}
 function filterBrowser(){browserSearchTerm=($('bq')?.value||'').toLowerCase();browserPageNumber=0;renderBrowser(currentBrowserPath,browserCrumbs)}
 let currentBrowserPath='repos',browserCrumbs='';
@@ -205,11 +205,11 @@ async function runAction(code,e){
   if((m=code.match(/^browserPage\('([^']*)'\)$/))) return browserPage(m[1]);
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
   if((m=code.match(/^checkOne\((\d+)\)$/))) return checkOne(Number(m[1]));
-  if((m=code.match(/^setDashboardPageSize\((.*)\)$/))) return setDashboardPageSize(Number(m[1]));
-  if((m=code.match(/^setReposPageSize\((.*)\)$/))) return setReposPageSize(Number(m[1]));
-  if((m=code.match(/^setQueuePageSize\((.*)\)$/))) return setQueuePageSize(Number(m[1]));
-  if((m=code.match(/^setBrowserPageSize\((.*)\)$/))) return setBrowserPageSize(Number(m[1]));
-  if((m=code.match(/^setStoragePageSize\((.*)\)$/))) return setStoragePageSize(Number(m[1]));
+  if((m=code.match(/^setDashboardPageSize\((.*)\)$/))) return setDashboardPageSize(m[1]==='this.value'?Number(t.value):Number(m[1]));
+  if((m=code.match(/^setReposPageSize\((.*)\)$/))) return setReposPageSize(m[1]==='this.value'?Number(t.value):Number(m[1]));
+  if((m=code.match(/^setQueuePageSize\((.*)\)$/))) return setQueuePageSize(m[1]==='this.value'?Number(t.value):Number(m[1]));
+  if((m=code.match(/^setBrowserPageSize\((.*)\)$/))) return setBrowserPageSize(m[1]==='this.value'?Number(t.value):Number(m[1]));
+  if((m=code.match(/^setStoragePageSize\((.*)\)$/))) return setStoragePageSize(m[1]==='this.value'?Number(t.value):Number(m[1]));
   if((m=code.match(/^retryRepo\((\d+)\)$/))) return retryRepo(Number(m[1]));
   if((m=code.match(/^retryRepo\((\d+)\)$/))) return retryRepo(Number(m[1]));
   if((m=code.match(/^delRepo\((\d+)\)$/))) return delRepo(Number(m[1]));
