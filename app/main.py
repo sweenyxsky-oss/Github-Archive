@@ -201,13 +201,20 @@ def upsert_version(c,repo,info):
     c.execute("""INSERT INTO versions(repo_id,version,tag_name,kind,published_at,html_url,target_sha,status,created_at,updated_at)
                  VALUES(?,?,?,?,?,?,?,'pending',?,?)
                  ON CONFLICT(repo_id,tag_name) DO UPDATE SET version=excluded.version,kind=excluded.kind,published_at=excluded.published_at,
-                 html_url=excluded.html_url,target_sha=excluded.target_sha,updated_at=excluded.updated_at""",
+                 html_url=excluded.html_url,target_sha=excluded.target_sha,
+                 status=CASE WHEN versions.target_sha IS NOT excluded.target_sha THEN 'pending' ELSE versions.status END,
+                 error=CASE WHEN versions.target_sha IS NOT excluded.target_sha THEN NULL ELSE versions.error END,
+                 updated_at=excluded.updated_at""",
               (repo["id"],info["version"],info["tag_name"],info["kind"],info["published_at"],info["html_url"],info["sha"],t,t))
     return c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo["id"],info["tag_name"])).fetchone()
 def upsert_file(c,vid,cat,name,rel,url,size=None,digest=None):
     c.execute("""INSERT INTO files(version_id,category,name,relative_path,source_url,expected_size,sha256,status)
                  VALUES(?,?,?,?,?,?,?,'pending')
-                 ON CONFLICT(version_id,relative_path) DO UPDATE SET source_url=excluded.source_url,expected_size=excluded.expected_size,sha256=excluded.sha256""",
+                 ON CONFLICT(version_id,relative_path) DO UPDATE SET
+                 source_url=excluded.source_url,expected_size=excluded.expected_size,sha256=excluded.sha256,
+                 status=CASE WHEN files.source_url IS NOT excluded.source_url OR files.expected_size IS NOT excluded.expected_size OR files.sha256 IS NOT excluded.sha256 THEN 'pending' ELSE files.status END,
+                 error=CASE WHEN files.source_url IS NOT excluded.source_url OR files.expected_size IS NOT excluded.expected_size OR files.sha256 IS NOT excluded.sha256 THEN NULL ELSE files.error END,
+                 verify_status=CASE WHEN files.source_url IS NOT excluded.source_url OR files.expected_size IS NOT excluded.expected_size OR files.sha256 IS NOT excluded.sha256 THEN 'unverified' ELSE files.verify_status END""",
               (vid,cat,name,rel,url,size,digest))
 def enqueue(c,fid):
     c.execute("INSERT OR IGNORE INTO queue(file_id,status,queued_at) VALUES(?,'queued',?)",(fid,now()))
@@ -451,7 +458,8 @@ async def import_repo_history(repo_id):
         c.execute("UPDATE repos SET status='queued',latest_version=?,latest_kind='release',latest_date=?,latest_url=?,last_checked_at=?,updated_at=? WHERE id=?",
                   ((releases[0]["version"] if releases else None),
                    (releases[0]["published_at"] if releases else None),
-                   (releases[0]["html_url"] if releases else None),now(),now(),repo_id))
+                   (releases[0]["html_url"] if releases else None),
+                   now(),now(),repo_id))
         c.commit(); c.close(); queue_event.set()
         if not releases:
             await check_repo(repo_id)
