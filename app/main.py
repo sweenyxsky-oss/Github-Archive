@@ -241,7 +241,14 @@ async def discover(repo, policy):
                           "html_url":f"https://github.com/{repo}/releases/tag/{quote(tag['name'],safe='')}",
                           "sha":sha,"assets":[]}
                 if mode=="tags_only" or chosen is None: chosen=tag_info
-        if chosen is None: return meta,None
+        if chosen is None:
+            branch=meta.get("default_branch") or "main"
+            branch_commit=await gh_json(client,api+"/commits/"+quote(branch,safe=""))
+            sha=branch_commit.get("sha")
+            if not sha: raise RuntimeError("GitHub repository has no resolvable default-branch commit")
+            chosen={"version":f"current-{sha[:12]}","tag_name":f"current-{sha[:12]}","kind":"current-source",
+                    "published_at":branch_commit.get("commit",{}).get("committer",{}).get("date"),
+                    "html_url":f"https://github.com/{repo}/tree/{sha}","sha":sha,"assets":[]}
         chosen["default_branch"]=meta["default_branch"]
         if tag_info: tag_info["default_branch"]=meta["default_branch"]
         return meta,(chosen,tag_info)
@@ -314,7 +321,10 @@ async def create_manifest(repo,version,info,include_current=True):
     if policy.get("assets",True) and version["kind"]=="release":
         for a in info.get("assets",[]):
             name=safe_name(a["name"]); asset_url=f"https://api.github.com/repos/{repo['full_name']}/releases/assets/{a['id']}"; upsert_file(c,version["id"],"release",name,str(Path("release")/name),asset_url,a.get("size"),a.get("digest"))
-    if policy.get("source",True):
+    if version["kind"]=="current-source":
+        n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
+        upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['target_sha'],safe='')}")
+    elif policy.get("source",True):
         n=f"{safe_name(repo['name'])}-{safe_name(version['tag_name'])}-source.zip"
         upsert_file(c,version["id"],"source",n,str(Path("source")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['tag_name'],safe='')}")
     if include_current and policy.get("current",True):
@@ -798,206 +808,3 @@ async def delete_repo(repo_id:int, body:DeleteRepoIn|None=None):
         c.close(); raise HTTPException(404,"Repository not found")
 
     # The archive directory is derived only from the tracked GitHub full_name,
-    # so deletion is limited to this repository's own archive tree.
-    owner,name=r["full_name"].split("/",1)
-    repo_root=REPOS_DIR/safe_name(owner)/safe_name(name)
-    if delete_files and repo_root.exists():
-        try:
-            shutil.rmtree(repo_root)
-        except OSError as e:
-            c.close(); raise HTTPException(500,f"Could not delete downloaded files: {e}")
-
-    c.execute("DELETE FROM repos WHERE id=?",(repo_id,)); c.commit(); c.close()
-    return {"ok":True,"full_name":r["full_name"],"files_deleted":delete_files}
-
-@app.put("/api/repos/{repo_id}/policy")
-async def set_policy(repo_id:int,body:PolicyIn):
-    c=db()
-    if not c.execute("SELECT 1 FROM repos WHERE id=?",(repo_id,)).fetchone(): c.close(); raise HTTPException(404,"Repository not found")
-    c.execute("UPDATE repos SET policy=?,updated_at=? WHERE id=?",(json.dumps(body.policy,separators=(",",":")),now(),repo_id)); c.commit(); c.close(); return {"ok":True,"policy":body.policy}
-
-@app.put("/api/repos/{repo_id}/group/{gid}")
-async def set_group(repo_id:int,gid:int):
-    c=db()
-    if not c.execute("SELECT 1 FROM repos WHERE id=?",(repo_id,)).fetchone(): c.close(); raise HTTPException(404,"Repository not found")
-    if not c.execute("SELECT 1 FROM groups WHERE id=?",(gid,)).fetchone(): c.close(); raise HTTPException(404,"Group not found")
-    c.execute("UPDATE repos SET group_id=?,updated_at=? WHERE id=?",(gid,now(),repo_id)); c.commit(); c.close(); return {"ok":True}
-
-@app.delete("/api/repos/{repo_id}/group")
-async def clear_group(repo_id:int):
-    c=db(); c.execute("UPDATE repos SET group_id=NULL,updated_at=? WHERE id=?",(now(),repo_id)); c.commit(); c.close(); return {"ok":True}
-
-@app.post("/api/repos/{repo_id}/check")
-async def manual_check(repo_id:int): return await check_repo(repo_id)
-
-@app.post("/api/repos/{repo_id}/retry")
-async def retry_repo(repo_id:int):
-    c=db(); repo=c.execute("SELECT id,status,archive_history FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
-    if not repo: raise HTTPException(404,"Repository not found")
-    if repo["status"]!="failed": return {"ok":True,"started":False,"status":repo["status"]}
-    if repo["archive_history"]:
-        asyncio.create_task(import_repo_history(repo_id))
-        return {"ok":True,"started":True,"mode":"historical"}
-    asyncio.create_task(check_repo(repo_id))
-    return {"ok":True,"started":True,"mode":"latest"}
-@app.post("/api/check-all")
-async def check_all():
-    c=db(); ids=[r["id"] for r in c.execute("SELECT id FROM repos").fetchall()]; c.close(); results=[]
-    for rid in ids:
-        try: results.append(await check_repo(rid))
-        except Exception as e: results.append({"status":"failed","error":str(e)})
-    return results
-
-@app.get("/api/repos/{repo_id}/versions")
-async def versions(repo_id:int):
-    c=db(); rows=c.execute("SELECT * FROM versions WHERE repo_id=? ORDER BY id DESC",(repo_id,)).fetchall(); c.close(); return [rd(x) for x in rows]
-
-@app.get("/api/versions/{version_id}")
-async def version_detail(version_id:int):
-    c=db(); v=c.execute("SELECT v.*,r.full_name,r.name repo_name FROM versions v JOIN repos r ON r.id=v.repo_id WHERE v.id=?",(version_id,)).fetchone()
-    if not v: c.close(); raise HTTPException(404,"Version not found")
-    fs=c.execute("SELECT * FROM files WHERE version_id=? ORDER BY category,name",(version_id,)).fetchall(); c.close()
-    return {"version":rd(v),"files":[rd(x) for x in fs]}
-
-@app.get("/api/queue")
-async def queue():
-    c=db(); rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
-      FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
-      ORDER BY q.id DESC LIMIT 500""").fetchall(); c.close(); return [rd(x) for x in rows]
-
-@app.post("/api/queue/{qid}/retry")
-async def retry_queue(qid:int):
-    c=db(); q=c.execute("SELECT * FROM queue WHERE id=?",(qid,)).fetchone()
-    if not q: c.close(); raise HTTPException(404,"Queue item not found")
-    c.execute("UPDATE queue SET status='queued',error=NULL,finished_at=NULL WHERE id=?",(qid,)); c.execute("UPDATE files SET status='pending',error=NULL WHERE id=?",(q["file_id"],)); c.commit(); c.close(); queue_event.set(); return {"ok":True}
-
-@app.get("/api/storage")
-async def storage():
-    c=db(); repo_count=c.execute("SELECT COUNT(*) n FROM repos").fetchone()["n"]; versions=c.execute("SELECT COUNT(*) n FROM versions").fetchone()["n"]
-    files=c.execute("SELECT COUNT(*) n FROM files WHERE status='complete'").fetchone()["n"]; size=c.execute("SELECT COALESCE(SUM(size),0) n FROM files WHERE status='complete'").fetchone()["n"]; c.close()
-    st=os.statvfs(DATA_DIR); return {"archive_bytes":size,"free_bytes":st.f_bavail*st.f_frsize,"total_bytes":st.f_blocks*st.f_frsize,"repos":repo_count,"versions":versions,"files":files}
-
-@app.get("/api/storage/repos")
-async def storage_repos():
-    c=db(); rows=c.execute("""SELECT r.full_name,r.name,COALESCE(SUM(f.size),0) size,COUNT(DISTINCT v.id) versions
-      FROM repos r LEFT JOIN versions v ON v.repo_id=r.id LEFT JOIN files f ON f.version_id=v.id AND f.status='complete'
-      GROUP BY r.id ORDER BY size DESC""").fetchall(); c.close(); return [rd(x) for x in rows]
-
-@app.get("/api/verify")
-async def verify_all():
-    c=db()
-    fs=c.execute("""SELECT f.*,v.version,r.full_name
-                   FROM files f
-                   JOIN versions v ON v.id=f.version_id
-                   JOIN repos r ON r.id=v.repo_id
-                   WHERE f.status='complete'""").fetchall()
-    c.close()
-    results=[]
-    ok=0
-    for f in fs:
-        base=repo_dirs(f["full_name"],f["version"])[0].resolve()
-        p=(base/f["relative_path"]).resolve()
-        safe=False
-        try:
-            p.relative_to(base)
-            safe=True
-        except ValueError:
-            pass
-        if not safe or not p.is_file() or p.is_symlink():
-            c=db()
-            c.execute("UPDATE files SET verify_status='failed',error=? WHERE id=?",
-                      ("missing or invalid archived file",f["id"]))
-            c.commit(); c.close()
-            results.append({"id":f["id"],"ok":False,"error":"missing or invalid archived file"})
-            continue
-        h=hashlib.sha256()
-        with p.open("rb") as x:
-            for data in iter(lambda:x.read(1024*1024),b""): h.update(data)
-        actual=h.hexdigest()
-        if f["sha256"] and f["sha256"].startswith("sha256:"):
-            good=actual.lower()==f["sha256"].split(":",1)[1].lower()
-            verify_status="verified" if good else "failed"
-        else:
-            good=True
-            verify_status="verified-local"
-        c=db()
-        c.execute("UPDATE files SET verify_status=?,error=NULL WHERE id=?",
-                  (verify_status if good else "failed",f["id"]))
-        c.commit(); c.close()
-        results.append({"id":f["id"],"ok":good,"sha256":actual})
-        ok+=1 if good else 0
-    return {"checked":len(results),"ok":ok,"failed":len(results)-ok,"results":results}
-
-@app.get("/api/search")
-async def search(q:str=""):
-    q="%"+q.strip()+"%"
-    c=db(); rows=c.execute("""SELECT r.id repo_id,r.full_name,v.id version_id,v.version,f.id file_id,f.name,f.category
-      FROM repos r LEFT JOIN versions v ON v.repo_id=r.id LEFT JOIN files f ON f.version_id=v.id
-      WHERE r.full_name LIKE ? OR v.version LIKE ? OR f.name LIKE ? ORDER BY r.full_name,v.id DESC LIMIT 500""",(q,q,q)).fetchall(); c.close(); return [rd(x) for x in rows]
-
-@app.get("/api/archive/tree")
-async def archive_tree():
-    def walk(p):
-        out=[]
-        if not p.exists(): return out
-        for x in sorted(p.iterdir(),key=lambda z:(not z.is_dir(),z.name.lower())):
-            out.append({"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":x.stat().st_size if x.is_file() else None})
-        return out
-    return {"root":"repos","entries":walk(REPOS_DIR)}
-
-@app.get("/api/archive/list")
-async def archive_list(path:str=""):
-    target=(DATA_DIR/path).resolve()
-    try:
-        target.relative_to(REPOS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(400,"Invalid archive path")
-    if not target.is_dir(): raise HTTPException(400,"Invalid archive path")
-    return {"path":str(target.relative_to(DATA_DIR)),"entries":[{"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":x.stat().st_size if x.is_file() else None} for x in sorted(target.iterdir(),key=lambda z:(not z.is_dir(),z.name.lower()))]}
-
-@app.get("/download/{file_id}")
-async def download(file_id:int):
-    f=await file_repo(file_id)
-    base=repo_dirs(f["full_name"],f["version"])[0].resolve()
-    p=(base/f["relative_path"]).resolve()
-    try: p.relative_to(base)
-    except ValueError: raise HTTPException(404,"Archived file is not available")
-    if p.is_symlink() or not p.is_file(): raise HTTPException(404,"Archived file is not available")
-    return FileResponse(p,filename=p.name)
-
-@app.get("/download/path/{path:path}")
-async def download_path(path:str):
-    target=(DATA_DIR/path).resolve()
-    try: target.relative_to(REPOS_DIR.resolve())
-    except ValueError: raise HTTPException(400,"Invalid archive path")
-    if target.is_symlink() or not target.is_file(): raise HTTPException(404,"Archived file is not available")
-    return FileResponse(target,filename=target.name)
-
-@app.post("/api/webhook")
-async def webhook(request:Request):
-    body=await request.body()
-    if WEBHOOK_SECRET:
-        sig=request.headers.get("x-hub-signature-256","")
-        expected="sha256="+hmac.new(WEBHOOK_SECRET.encode(),body,hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig,expected): raise HTTPException(401,"Invalid webhook signature")
-    try: payload=json.loads(body)
-    except Exception: raise HTTPException(400,"Invalid JSON")
-    event=request.headers.get("x-github-event","").lower()
-    if event not in ("release","create","ping",""):
-        return {"ok":True,"queued":False,"event":event}
-    if event=="create" and payload.get("ref_type")!="tag":
-        return {"ok":True,"queued":False,"event":event}
-    repo=payload.get("repository",{}).get("full_name")
-    if not repo: return {"ok":True,"queued":False}
-    c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
-    if r and r["monitoring"]: asyncio.create_task(check_repo(r["id"])); return {"ok":True,"queued":True,"repository":repo}
-    if r: return {"ok":True,"queued":False,"repository":repo,"monitoring":False}
-    return {"ok":True,"queued":False,"repository":repo}
-
-@app.get("/api/activity")
-async def activity():
-    c=db(); rows=c.execute("""SELECT 'version' type,v.updated_at timestamp,r.full_name,v.version,v.status,v.error
-      FROM versions v JOIN repos r ON r.id=v.repo_id
-      UNION ALL SELECT 'file' type,f.downloaded_at timestamp,r.full_name,f.name,f.status,f.error
-      FROM files f JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
-      WHERE f.downloaded_at IS NOT NULL ORDER BY timestamp DESC LIMIT 100""").fetchall(); c.close(); return [rd(x) for x in rows]
