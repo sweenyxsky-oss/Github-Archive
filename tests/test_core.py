@@ -20,6 +20,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(main.safe_name("hello world"), "hello_world")
         self.assertEqual(main.safe_name("a/b:c"), "a_b_c")
 
+    def test_version_paths_do_not_collide(self):
+        a=main.repo_dirs("octocat/test","release/foo")[0]
+        b=main.repo_dirs("octocat/test","release_foo")[0]
+        self.assertNotEqual(a,b)
+
     def test_queue_claim_is_atomic_and_uses_file_id(self):
         c = main.db()
         t = main.now()
