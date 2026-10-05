@@ -133,6 +133,7 @@ async def discover(repo, policy):
         chosen=None
         tag_info=None
         for rel in releases:
+            if not policy.get("releases",True): break
             if rel.get("draft") or (rel.get("prerelease") and not policy.get("prereleases",False)): continue
             sha=await resolve_tag_sha(client,repo,rel["tag_name"])
             chosen={"version":rel["tag_name"],"tag_name":rel["tag_name"],"kind":"release",
@@ -423,18 +424,39 @@ async def check_repo(repo_id):
         try:
             policy=policy_for(repo); meta,discovered=await discover(repo["full_name"],policy)
             info,tag_info=discovered if discovered else (None,None)
-            c=db(); c.execute("UPDATE repos SET name=?,default_branch=?,status='checking',error=NULL,updated_at=? WHERE id=?",(meta["name"],meta["default_branch"],now(),repo_id)); c.commit()
+            c=db()
+            c.execute("UPDATE repos SET name=?,default_branch=?,status='checking',error=NULL,updated_at=? WHERE id=?",
+                      (meta["name"],meta["default_branch"],now(),repo_id))
+            c.commit()
             if info is None:
-                c.execute("UPDATE repos SET status='no_version',last_checked_at=?,updated_at=? WHERE id=?",(now(),now(),repo_id)); c.commit(); c.close(); return {"status":"no_version"}
+                c.execute("UPDATE repos SET status='no_version',last_checked_at=?,updated_at=? WHERE id=?",
+                          (now(),now(),repo_id))
+                c.commit(); c.close()
+                return {"status":"no_version"}
             repo_now=dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone())
-            v=upsert_version(c,repo_now,info); c.commit()
+            c.close()
+
+            c=db()
+            v=upsert_version(c,repo_now,info)
+            c.commit()
             known=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone()
-            if known["status"]!="complete": await create_manifest(repo_now,known,info)
+            c.close()
+            if known["status"]!="complete":
+                await create_manifest(repo_now,known,info)
+
             if policy.get("mode")=="both" and tag_info and tag_info["tag_name"]!=info["tag_name"]:
-                tv=upsert_version(c,repo_now,tag_info); c.commit()
-                if tv["status"]!="complete": await create_manifest(repo_now,tv,tag_info)
+                c=db()
+                tv=upsert_version(c,repo_now,tag_info)
+                c.commit()
+                known_tag=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,tag_info["tag_name"])).fetchone()
+                c.close()
+                if known_tag["status"]!="complete":
+                    await create_manifest(repo_now,known_tag,tag_info)
+
+            c=db()
             c.execute("UPDATE repos SET latest_version=?,latest_kind=?,latest_date=?,latest_url=?,last_checked_at=?,status='queued',error=NULL,updated_at=? WHERE id=?",
-                      (info["version"],info["kind"],info["published_at"],info["html_url"],now(),now(),repo_id)); c.commit(); c.close(); queue_event.set()
+                      (info["version"],info["kind"],info["published_at"],info["html_url"],now(),now(),repo_id))
+            c.commit(); c.close(); queue_event.set()
             return {"status":"queued","version":info["version"],"kind":info["kind"]}
         except Exception as e:
             c=db(); c.execute("UPDATE repos SET status='failed',error=?,last_checked_at=?,updated_at=? WHERE id=?",(str(e)[:4000],now(),now(),repo_id)); c.commit(); c.close(); raise
