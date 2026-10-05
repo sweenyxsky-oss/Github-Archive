@@ -2,7 +2,7 @@ let repos=[],groups=[],state={page:'dashboard',repo:null},adminToken=sessionStor
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=s=>s?new Date(s).toLocaleString():'—';
-const bytes=n=>{n=Number(n||0);if(n===0)return'0 B';const k=1024,sizes=['B','KB','MB','GB'];let i=Math.floor(Math.log(n)/Math.log(k));return(n/Math.pow(k,i)).toFixed(2)+' '+sizes[Math.min(i,sizes.length-1)]};
+const bytes=n=>{n=Number(n||0);if(n===0)return'0 B';const k=1024,sizes=['B','KB','MB','GB','TB','PB'];let i=Math.floor(Math.log(n)/Math.log(k));i=Math.min(i,sizes.length-1);return(n/Math.pow(k,i)).toFixed(2)+' '+sizes[i]};
 const duration=s=>{s=Number(s||0);if(!s)return'—';s=Math.round(s);const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);const sec=s%60;return h?h+'h '+m+'m':m?m+'m '+sec+'s':sec+'s'};
 const versionKind=v=>v.kind==='current-source'?'Current Source':(v.kind||'Version');
 const shortSha=s=>s?(String(s).slice(0,12)+'…'):'';
