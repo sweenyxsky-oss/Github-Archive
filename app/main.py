@@ -96,6 +96,10 @@ def db():
     cols={r["name"] for r in c.execute("PRAGMA table_info(repos)").fetchall()}
     if "monitoring" not in cols: c.execute("ALTER TABLE repos ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1")
     if "archive_history" not in cols: c.execute("ALTER TABLE repos ADD COLUMN archive_history INTEGER NOT NULL DEFAULT 0")
+    fcols={r["name"] for r in c.execute("PRAGMA table_info(files)").fetchall()}
+    if "progress_bytes" not in fcols: c.execute("ALTER TABLE files ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
+    if "speed_bps" not in fcols: c.execute("ALTER TABLE files ADD COLUMN speed_bps REAL NOT NULL DEFAULT 0")
+    if "eta_seconds" not in fcols: c.execute("ALTER TABLE files ADD COLUMN eta_seconds REAL")
     defaults={"check_interval_minutes":str(DEFAULT_INTERVAL),"include_prereleases":str(DEFAULT_PRERELEASES).lower()}
     for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
     c.commit(); return c
@@ -341,6 +345,9 @@ async def create_manifest(repo,version,info,include_current=True):
 
 async def download_one(f):
     file_id=f["file_id"]
+    progress_last_write=0.0
+    progress_started=asyncio.get_running_loop().time()
+    progress_base=0
     base=repo_dirs(f["full_name"],f["version"])[0]
     target=(base/Path(f["relative_path"])).resolve()
     if not str(target).startswith(str(base.resolve())+os.sep):
@@ -368,13 +375,27 @@ async def download_one(f):
                                 if rr.status_code==416: part.unlink(missing_ok=True); continue
                                 if rr.status_code>=400: raise RuntimeError(f"Download HTTP {rr.status_code}")
                                 with part.open("ab" if start and rr.status_code==206 else "wb") as out:
-                                    async for chunk in rr.aiter_bytes(1024*1024): out.write(chunk)
+                                    async for chunk in rr.aiter_bytes(1024*1024):
+                                    out.write(chunk)
+                                    progress_base += len(chunk)
+                                    tnow=asyncio.get_running_loop().time()
+                                    if tnow-progress_last_write>=0.75:
+                                        elapsed=max(0.001,tnow-progress_started); total_bytes=start+progress_base
+                                        speed=total_bytes/elapsed; eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
+                                        c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close(); progress_last_write=tnow
                         else:
                             if start and r.status_code==200: start=0; part.unlink(missing_ok=True)
                             if r.status_code==416: part.unlink(missing_ok=True); continue
                             if r.status_code>=400: raise RuntimeError(f"Download HTTP {r.status_code}")
                             with part.open("ab" if start and r.status_code==206 else "wb") as out:
-                                async for chunk in r.aiter_bytes(1024*1024): out.write(chunk)
+                                async for chunk in r.aiter_bytes(1024*1024):
+                                out.write(chunk)
+                                progress_base += len(chunk)
+                                tnow=asyncio.get_running_loop().time()
+                                if tnow-progress_last_write>=0.75:
+                                    elapsed=max(0.001,tnow-progress_started); total_bytes=start+progress_base
+                                    speed=total_bytes/elapsed; eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
+                                    c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close(); progress_last_write=tnow
                 size=part.stat().st_size
                 if expected is not None and size!=expected: raise RuntimeError(f"Size mismatch: got {size}, expected {expected}")
                 h=hashlib.sha256()
@@ -385,8 +406,8 @@ async def download_one(f):
                     raise RuntimeError("SHA-256 digest mismatch")
                 part.replace(target)
                 c=db()
-                c.execute("UPDATE files SET status='complete',size=?,downloaded_at=?,error=NULL,verify_status=? WHERE id=?",
-                          (size,now(),"verified" if digest else "verified-local",file_id))
+                c.execute("UPDATE files SET status='complete',size=?,downloaded_at=?,progress_bytes=?,speed_bps=0,eta_seconds=NULL,error=NULL,verify_status=? WHERE id=?",
+                          (size,now(),size,"verified" if digest else "verified-local",file_id))
                 c.execute("UPDATE queue SET status='done',finished_at=?,error=NULL WHERE id=?",
                           (now(),f["queue_id"]))
                 c.commit(); c.close()
@@ -396,7 +417,7 @@ async def download_one(f):
                 await asyncio.sleep(min(30,2**attempt))
     except Exception as e:
         c=db()
-        c.execute("UPDATE files SET status='failed',error=?,verify_status='failed' WHERE id=?",(str(e)[:2000],file_id))
+        c.execute("UPDATE files SET status='failed',error=?,speed_bps=0,eta_seconds=NULL,verify_status='failed' WHERE id=?",(str(e)[:2000],file_id))
         c.execute("UPDATE queue SET status='failed',finished_at=?,error=? WHERE id=?",(now(),str(e)[:2000],f["queue_id"]))
         c.commit(); c.close()
         raise
@@ -840,7 +861,7 @@ async def version_detail(version_id:int):
 
 @app.get("/api/queue")
 async def queue():
-    c=db(); rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.status file_status,v.version,r.full_name
+    c=db(); rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
       FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
       ORDER BY q.id DESC LIMIT 500""").fetchall(); c.close(); return [rd(x) for x in rows]
 
