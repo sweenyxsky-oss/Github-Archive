@@ -797,6 +797,8 @@ async def import_user_endpoint(body:UserIn):
     try:
         results=await import_user(username,body.archive_all)
     except Exception as e:
+        raise HTTPException(400,str(e))
+    return {"username":username,"count":len(results),"repositories":results}
 
 @app.delete("/api/repos/{repo_id}")
 async def delete_repo(repo_id:int, body:DeleteRepoIn|None=None):
@@ -998,11 +1000,3 @@ async def webhook(request:Request):
     repo=payload.get("repository",{}).get("full_name")
     if not repo: return {"ok":True,"queued":False}
     c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
-    if r and r["monitoring"]: asyncio.create_task(check_repo(r["id"])); return {"ok":True,"queued":True,"repository":repo}
-    if r: return {"ok":True,"queued":False,"repository":repo,"monitoring":False}
-    return {"ok":True,"queued":False,"repository":repo}
-
-@app.get("/api/activity")
-async def activity():
-    c=db(); rows=c.execute("""SELECT 'version' type,v.updated_at timestamp,r.full_name,v.version,v.status,v.error
-      FROM versions v JOIN repos r ON r.id=v.repo_id
