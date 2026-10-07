@@ -900,6 +900,32 @@ async def version_detail(version_id:int):
     fs=c.execute("SELECT * FROM files WHERE version_id=? ORDER BY category,name",(version_id,)).fetchall(); c.close()
     return {"version":rd(v),"files":[rd(x) for x in fs]}
 
+@app.get("/api/queue/status")
+async def queue_status():
+    c=db()
+    counts={r["status"]:r["n"] for r in c.execute("SELECT status,COUNT(*) n FROM queue GROUP BY status").fetchall()}
+    running=c.execute("SELECT MIN(started_at) oldest FROM queue WHERE status='running'").fetchone()["oldest"]
+    queued=c.execute("SELECT MIN(queued_at) oldest FROM queue WHERE status='queued'").fetchone()["oldest"]
+    broken=c.execute("""SELECT COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id
+                        WHERE q.status='queued' AND f.status='complete'""").fetchone()["n"]
+    c.close()
+    return {"queued":counts.get("queued",0),"running":counts.get("running",0),
+            "done":counts.get("done",0),"failed":counts.get("failed",0),
+            "oldest_queued_at":queued,"oldest_running_at":running,
+            "inconsistent_complete_queued":broken,"workers":WORKERS}
+
+@app.post("/api/queue/recover")
+async def recover_queue():
+    c=db()
+    stale=c.execute("""UPDATE queue SET status='queued',started_at=NULL,error='Recovered stale running item'
+                       WHERE status='running' AND started_at IS NOT NULL
+                       AND (julianday('now')-julianday(started_at))*86400 > 1800""").rowcount
+    fixed=c.execute("""UPDATE queue SET status='done',finished_at=COALESCE(finished_at,?)
+                       WHERE status='queued' AND file_id IN
+                       (SELECT id FROM files WHERE status='complete')""",(now(),)).rowcount
+    c.commit(); c.close(); queue_event.set()
+    return {"ok":True,"requeued_stale":stale,"completed_inconsistent":fixed}
+
 @app.get("/api/queue")
 async def queue():
     c=db(); rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
@@ -991,6 +1017,14 @@ def archive_entry(x):
         except OSError: size=0
     return {"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":size}
 
+def archive_target(path):
+    target=(DATA_DIR/path).resolve()
+    try:
+        target.relative_to(REPOS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400,"Invalid archive path")
+    return target
+
 @app.get("/api/archive/tree")
 async def archive_tree():
     if not REPOS_DIR.exists(): return {"root":"repos","entries":[]}
@@ -1000,15 +1034,46 @@ async def archive_tree():
 
 @app.get("/api/archive/list")
 async def archive_list(path:str=""):
-    target=(DATA_DIR/path).resolve()
-    try:
-        target.relative_to(REPOS_DIR.resolve())
-    except ValueError:
-        raise HTTPException(400,"Invalid archive path")
+    target=archive_target(path)
     if not target.is_dir(): raise HTTPException(400,"Invalid archive path")
     entries=[archive_entry(x) for x in target.iterdir()]
     entries.sort(key=lambda x:(not x["directory"],x["name"].lower()))
     return {"path":str(target.relative_to(DATA_DIR)),"entries":entries}
+
+@app.post("/api/archive/delete")
+async def archive_delete(body:dict):
+    paths=body.get("paths") or []
+    if not isinstance(paths,list) or not paths: raise HTTPException(400,"No archive items selected")
+    deleted=[]
+    for rel in paths:
+        target=archive_target(str(rel))
+        if target == REPOS_DIR.resolve(): raise HTTPException(400,"Cannot delete archive root")
+        if not target.exists(): continue
+        if target.is_dir(): shutil.rmtree(target)
+        else: target.unlink()
+        deleted.append(str(target.relative_to(DATA_DIR)))
+    return {"ok":True,"deleted":deleted}
+
+@app.post("/api/archive/move")
+async def archive_move(body:dict):
+    paths=body.get("paths") or []
+    destination=str(body.get("destination") or "").strip()
+    if not isinstance(paths,list) or not paths: raise HTTPException(400,"No archive items selected")
+    dest=archive_target(destination)
+    if not dest.is_dir(): raise HTTPException(400,"Destination folder does not exist")
+    resolved=[]
+    for rel in paths:
+        src=archive_target(str(rel))
+        if src == REPOS_DIR.resolve(): raise HTTPException(400,"Cannot move archive root")
+        if not src.exists(): raise HTTPException(404,f"Archive item not found: {rel}")
+        try: src.relative_to(dest)
+        except ValueError: pass
+        else: raise HTTPException(400,"Cannot move a folder into itself")
+        target=dest/src.name
+        if target.exists(): raise HTTPException(409,f"Destination already contains: {src.name}")
+        resolved.append((src,target))
+    for src,target in resolved: shutil.move(str(src),str(target))
+    return {"ok":True,"moved":[str(target.relative_to(DATA_DIR)) for _,target in resolved]}
 
 @app.get("/download/{file_id}")
 async def download(file_id:int):
