@@ -927,10 +927,22 @@ async def recover_queue():
     return {"ok":True,"requeued_stale":stale,"completed_inconsistent":fixed}
 
 @app.get("/api/queue")
-async def queue():
-    c=db(); rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
-      FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
-      ORDER BY q.id DESC LIMIT 500""").fetchall(); c.close(); return [rd(x) for x in rows]
+async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
+    page=max(1,page); page_size=min(100,max(1,page_size)); search=search.strip().lower()
+    sort_map={"id-asc":"q.id ASC","id-desc":"q.id DESC","queued-asc":"q.queued_at ASC","queued-desc":"q.queued_at DESC",
+              "started-asc":"q.started_at ASC","started-desc":"q.started_at DESC","status-asc":"q.status ASC","status-desc":"q.status DESC",
+              "attempts-asc":"q.attempts ASC","attempts-desc":"q.attempts DESC","repo-asc":"r.full_name COLLATE NOCASE ASC",
+              "repo-desc":"r.full_name COLLATE NOCASE DESC","file-asc":"f.name COLLATE NOCASE ASC","file-desc":"f.name COLLATE NOCASE DESC"}
+    order=sort_map.get(sort,"q.id DESC"); where=""; params=[]
+    if search:
+        like=f"%{search}%"; where="WHERE lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"; params.append(like)
+    c=db()
+    total=c.execute("""SELECT COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where,params).fetchone()["n"]
+    offset=(page-1)*page_size
+    rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
+      FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",params+[page_size,offset]).fetchall()
+    c.close()
+    return {"items":[rd(x) for x in rows],"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size),"sort":sort,"search":search}
 
 @app.post("/api/queue/{qid}/retry")
 async def retry_queue(qid:int):
