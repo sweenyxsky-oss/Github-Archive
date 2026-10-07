@@ -932,7 +932,9 @@ async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
     sort_map={"id-asc":"q.id ASC","id-desc":"q.id DESC","queued-asc":"q.queued_at ASC","queued-desc":"q.queued_at DESC",
               "started-asc":"q.started_at ASC","started-desc":"q.started_at DESC","status-asc":"q.status ASC","status-desc":"q.status DESC",
               "attempts-asc":"q.attempts ASC","attempts-desc":"q.attempts DESC","repo-asc":"r.full_name COLLATE NOCASE ASC",
-              "repo-desc":"r.full_name COLLATE NOCASE DESC","file-asc":"f.name COLLATE NOCASE ASC","file-desc":"f.name COLLATE NOCASE DESC"}
+              "repo-desc":"r.full_name COLLATE NOCASE DESC","file-asc":"f.name COLLATE NOCASE ASC","file-desc":"f.name COLLATE NOCASE DESC","category-asc":"f.category COLLATE NOCASE ASC","category-desc":"f.category COLLATE NOCASE DESC",
+              "progress-asc":"f.progress_bytes ASC","progress-desc":"f.progress_bytes DESC","speed-asc":"f.speed_bps ASC","speed-desc":"f.speed_bps DESC",
+              "eta-asc":"COALESCE(f.eta_seconds,999999999) ASC","eta-desc":"COALESCE(f.eta_seconds,999999999) DESC"}
     order=sort_map.get(sort,"q.id DESC"); where=""; params=[]
     if search:
         like=f"%{search}%"; where="WHERE lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"; params.append(like)
