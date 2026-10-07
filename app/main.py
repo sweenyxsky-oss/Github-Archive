@@ -466,7 +466,7 @@ def claim_next_queue_item():
         if not row:
             c.commit()
             return None
-        changed=c.execute("""UPDATE queue SET status='running',started_at=?,attempts=attempts+1,error=NULL
+        changed=c.execute("""UPDATE queue SET status='running',priority=0,started_at=?,attempts=attempts+1,error=NULL
                              WHERE id=? AND status='queued'""",(now(),row["queue_id"])).rowcount
         if changed != 1:
             c.rollback()
