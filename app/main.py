@@ -954,17 +954,21 @@ async def retry_queue(qid:int):
 
 @app.post("/api/queue/{qid}/force")
 async def force_queue(qid:int):
-    c=db(); q=c.execute("SELECT q.*,f.status file_status FROM queue q JOIN files f ON f.id=q.file_id WHERE q.id=?",(qid,)).fetchone()
+    c=db()
+    q=c.execute("SELECT q.*,f.status file_status FROM queue q JOIN files f ON f.id=q.file_id WHERE q.id=?",(qid,)).fetchone()
     if not q:
-        c.close(); raise HTTPException(404,"Queue item not found")
+        c.close()
+        raise HTTPException(404,"Queue item not found")
     if q["status"]=="running":
-        c.close(); raise HTTPException(409,"Queue item is already running")
-    if q["status"] not in ("queued","failed"):
-        c.close(); raise HTTPException(409,f"Queue item cannot be forced from status {q['status']}")
-    c.execute("UPDATE queue SET status='queued',priority=1,error=NULL,finished_at=NULL,started_at=NULL,queued_at=? WHERE id=?",(now(),qid))
+        c.close()
+        raise HTTPException(409,"Queue item is already running")
+    c.execute("UPDATE queue SET status='queued',priority=1,error=NULL,finished_at=NULL,started_at=NULL,queued_at=? WHERE id=?",
+              (now(),qid))
     c.execute("UPDATE files SET status='pending',error=NULL WHERE id=?",(q["file_id"],))
-    c.commit(); c.close(); queue_event.set()
-    return {"ok":True,"forced":True}
+    c.commit()
+    c.close()
+    queue_event.set()
+    return {"ok":True,"forced":True,"queue_id":qid}
 
 @app.get("/api/storage")
 async def storage():
