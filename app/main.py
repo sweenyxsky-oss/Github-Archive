@@ -976,15 +976,27 @@ async def search(q:str=""):
       FROM repos r LEFT JOIN versions v ON v.repo_id=r.id LEFT JOIN files f ON f.version_id=v.id
       WHERE r.full_name LIKE ? OR v.version LIKE ? OR f.name LIKE ? ORDER BY r.full_name,v.id DESC LIMIT 500""",(q,q,q)).fetchall(); c.close(); return [rd(x) for x in rows]
 
+def archive_entry(x):
+    if x.is_dir():
+        size=0
+        try:
+            for p in x.rglob("*"):
+                if p.is_file() and not p.is_symlink():
+                    try: size+=p.stat().st_size
+                    except OSError: pass
+        except OSError:
+            pass
+    else:
+        try: size=x.stat().st_size
+        except OSError: size=0
+    return {"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":size}
+
 @app.get("/api/archive/tree")
 async def archive_tree():
-    def walk(p):
-        out=[]
-        if not p.exists(): return out
-        for x in sorted(p.iterdir(),key=lambda z:(not z.is_dir(),z.name.lower())):
-            out.append({"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":x.stat().st_size if x.is_file() else None})
-        return out
-    return {"root":"repos","entries":walk(REPOS_DIR)}
+    if not REPOS_DIR.exists(): return {"root":"repos","entries":[]}
+    entries=[archive_entry(x) for x in REPOS_DIR.iterdir()]
+    entries.sort(key=lambda x:(not x["directory"],x["name"].lower()))
+    return {"root":"repos","entries":entries}
 
 @app.get("/api/archive/list")
 async def archive_list(path:str=""):
@@ -994,7 +1006,9 @@ async def archive_list(path:str=""):
     except ValueError:
         raise HTTPException(400,"Invalid archive path")
     if not target.is_dir(): raise HTTPException(400,"Invalid archive path")
-    return {"path":str(target.relative_to(DATA_DIR)),"entries":[{"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":x.stat().st_size if x.is_file() else None} for x in sorted(target.iterdir(),key=lambda z:(not z.is_dir(),z.name.lower()))]}
+    entries=[archive_entry(x) for x in target.iterdir()]
+    entries.sort(key=lambda x:(not x["directory"],x["name"].lower()))
+    return {"path":str(target.relative_to(DATA_DIR)),"entries":entries}
 
 @app.get("/download/{file_id}")
 async def download(file_id:int):
