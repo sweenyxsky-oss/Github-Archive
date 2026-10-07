@@ -266,7 +266,7 @@ document.addEventListener('click',e=>{
   if(qs){queueSortClick(qs.getAttribute('data-queue-sort'));return;}
   const bp=e.target.closest('[data-browser-path]'); if(bp){browserPage(bp.getAttribute('data-browser-path'));return;} const el=e.target.closest('[data-click]'); if(el) runAction(el.getAttribute('data-click'),e).catch(x=>alert(x.message)); });
 document.addEventListener('change',e=>{
-  const qps=e.target.closest('#queueResults + .pager select, #queueResults ~ .pager select');
+  const qps=e.target.closest('#queueResults .pager select');
   if(qps){setQueuePageSize(qps.value);return;}
   const bs=e.target.closest('[data-browser-select]'); if(bs){browserSelectionChanged(bs);return;} const ba=e.target.closest('[data-browser-all]'); if(ba){toggleBrowserAll(ba);return;} const el=e.target.closest('[data-change]'); if(el) runAction(el.getAttribute('data-change'),e).catch(x=>alert(x.message)); });
 document.addEventListener('input',e=>{ const el=e.target.closest('[data-input]'); if(el) runAction(el.getAttribute('data-input'),e).catch(x=>alert(x.message)); });
