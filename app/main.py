@@ -327,7 +327,7 @@ async def create_manifest(repo,version,info,include_current=True):
     elif policy.get("source",True):
         n=f"{safe_name(repo['name'])}-{safe_name(version['tag_name'])}-source.zip"
         upsert_file(c,version["id"],"source",n,str(Path("source")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['tag_name'],safe='')}")
-    if include_current and policy.get("current",True):
+    if include_current and policy.get("current",True) and version["kind"]!="current-source":
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
         upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
     if policy.get("artifacts",False) and version["target_sha"]:
@@ -489,10 +489,21 @@ async def worker():
                 except asyncio.TimeoutError: pass
                 queue_event.clear()
                 continue
-            try: await download_one(q)
-            except Exception: pass
+            try:
+                await download_one(q)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
             await asyncio.sleep(2)
+
+async def ensure_workers():
+    global worker_tasks
+    worker_tasks=[t for t in worker_tasks if not t.done()]
+    while len(worker_tasks)<WORKERS:
+        worker_tasks.append(asyncio.create_task(worker()))
+    queue_event.set()
 
 async def archive_version(repo,version,info):
     await create_manifest(repo,version,info)
@@ -745,7 +756,7 @@ async def shutdown():
 @app.get("/",response_class=HTMLResponse)
 async def index(): return HTMLResponse((Path(__file__).parent/"static"/"index.html").read_text(encoding="utf-8"))
 @app.get("/health")
-async def health(): return {"ok":True,"version":"2.0.0","workers":WORKERS}
+async def health(): return {"ok":True,"version":"2.0.0","workers":WORKERS,"workers_alive":sum(1 for t in worker_tasks if not t.done())}
 
 @app.get("/api/scheduler/status")
 async def scheduler_status_api():
@@ -923,7 +934,7 @@ async def recover_queue():
     fixed=c.execute("""UPDATE queue SET status='done',finished_at=COALESCE(finished_at,?)
                        WHERE status='queued' AND file_id IN
                        (SELECT id FROM files WHERE status='complete')""",(now(),)).rowcount
-    c.commit(); c.close(); queue_event.set()
+    c.commit(); c.close(); await ensure_workers()
     return {"ok":True,"requeued_stale":stale,"completed_inconsistent":fixed}
 
 @app.get("/api/queue")
