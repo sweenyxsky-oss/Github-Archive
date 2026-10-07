@@ -211,6 +211,7 @@ function apiPage(){$('app').innerHTML='<h2>REST API</h2><div class="card"><p>The
 
 async function runAction(code,e){
   const t=e?.target;
+  let m;
   if(code==="addRepo()") return addRepo();
   if(code==="addUser()") return addUser();
   if(code==="checkAll()") return checkAll();
@@ -234,7 +235,6 @@ async function runAction(code,e){
   if(code==="storagePrev()") return storagePrev();
   if(code==="storageNext()") return storageNext();
   if(code==="document.getElementById('addRepoModal').remove()") return document.getElementById('addRepoModal')?.remove();
-  let m;
   if((m=code.match(/^page\('([^']+)'\)$/))) return page(m[1]);
   if((m=code.match(/^browserPage\('([^']*)'\)$/))) return browserPage(m[1]);
   if((m=code.match(/^repoPage\((\d+)\)$/))) return repoPage(Number(m[1]));
