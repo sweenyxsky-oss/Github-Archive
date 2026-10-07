@@ -256,6 +256,7 @@ async function runAction(code,e){
   if((m=code.match(/^savePolicy\((\d+)\)$/))) return savePolicy(Number(m[1]));
   if((m=code.match(/^versionPage\((\d+)\)$/))) return versionPage(Number(m[1]));
   if((m=code.match(/^retry\((\d+)\)$/))) return retry(Number(m[1]));
+  if((m=code.match(/^forceQueue\((\d+)\)$/))) return forceQueue(Number(m[1]));
   if((m=code.match(/^delGroup\((\d+)\)$/))) return delGroup(Number(m[1]));
   if((m=code.match(/^setMonitoring\((\d+),this\.checked\)$/))) return setMonitoring(Number(m[1]),!!t.checked);
   if((m=code.match(/^setGroup\((\d+),this\.value\)$/))) return setGroup(Number(m[1]),t.value);
