@@ -224,6 +224,10 @@ async function runAction(code,e){
   if(code==="filterBrowser()") return filterBrowser();
   if(code==="setQueueSort(this.value)") return setQueueSort(t.value);
   if((m=code.match(/^queueSortClick\\('([^']+)'\\)$/))) return queueSortClick(m[1]);
+  if((m=code.match(/^setQueueSort\\('([^']+)'\\)$/))) return setQueueSort(m[1]);
+  if(code==="deleteBrowserSelected()") return deleteBrowserSelected();
+  if(code==="moveBrowserSelected()") return moveBrowserSelected();
+  if(code==="recoverQueue()") return recoverQueue();
   if(code==="dashPrev()") return dashPrev();
   if(code==="dashNext()") return dashNext();
   if(code==="repoPrev()") return repoPrev();
