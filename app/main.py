@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE TABLE IF NOT EXISTS queue (
  id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
- status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0,
  queued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_versions_repo ON versions(repo_id);
@@ -462,7 +462,7 @@ def claim_next_queue_item():
                          JOIN versions v ON v.id=f.version_id
                          JOIN repos r ON r.id=v.repo_id
                          WHERE q.status='queued'
-                         ORDER BY q.id LIMIT 1""").fetchone()
+                         ORDER BY q.priority DESC,q.id LIMIT 1""").fetchone()
         if not row:
             c.commit()
             return None
@@ -930,12 +930,12 @@ async def recover_queue():
 async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
     page=max(1,page); page_size=min(100,max(1,page_size)); search=search.strip().lower()
     sort_map={"id-asc":"q.id ASC","id-desc":"q.id DESC","queued-asc":"q.queued_at ASC","queued-desc":"q.queued_at DESC",
-              "started-asc":"q.started_at ASC","started-desc":"q.started_at DESC","status-asc":"q.status ASC","status-desc":"q.status DESC",
+              "started-asc":"q.started_at ASC","started-desc":"q.started_at DESC","status-asc":"f.status ASC","status-desc":"f.status DESC",
               "attempts-asc":"q.attempts ASC","attempts-desc":"q.attempts DESC","repo-asc":"r.full_name COLLATE NOCASE ASC",
               "repo-desc":"r.full_name COLLATE NOCASE DESC","file-asc":"f.name COLLATE NOCASE ASC","file-desc":"f.name COLLATE NOCASE DESC","category-asc":"f.category COLLATE NOCASE ASC","category-desc":"f.category COLLATE NOCASE DESC",
-              "progress-asc":"f.progress_bytes ASC","progress-desc":"f.progress_bytes DESC","speed-asc":"f.speed_bps ASC","speed-desc":"f.speed_bps DESC",
+              "progress-asc":"COALESCE(f.progress_bytes,0) ASC","progress-desc":"COALESCE(f.progress_bytes,0) DESC","speed-asc":"COALESCE(f.speed_bps,0) ASC","speed-desc":"COALESCE(f.speed_bps,0) DESC",
               "eta-asc":"COALESCE(f.eta_seconds,999999999) ASC","eta-desc":"COALESCE(f.eta_seconds,999999999) DESC"}
-    order=sort_map.get(sort,"q.id DESC"); where=""; params=[]
+    order=sort_map.get(sort,"q.id DESC")+", q.id DESC"; where=""; params=[]
     if search:
         like=f"%{search}%"; where="WHERE lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"; params.append(like)
     c=db()
@@ -951,6 +951,20 @@ async def retry_queue(qid:int):
     c=db(); q=c.execute("SELECT * FROM queue WHERE id=?",(qid,)).fetchone()
     if not q: c.close(); raise HTTPException(404,"Queue item not found")
     c.execute("UPDATE queue SET status='queued',error=NULL,finished_at=NULL WHERE id=?",(qid,)); c.execute("UPDATE files SET status='pending',error=NULL WHERE id=?",(q["file_id"],)); c.commit(); c.close(); queue_event.set(); return {"ok":True}
+
+@app.post("/api/queue/{qid}/force")
+async def force_queue(qid:int):
+    c=db(); q=c.execute("SELECT q.*,f.status file_status FROM queue q JOIN files f ON f.id=q.file_id WHERE q.id=?",(qid,)).fetchone()
+    if not q:
+        c.close(); raise HTTPException(404,"Queue item not found")
+    if q["status"]=="running":
+        c.close(); raise HTTPException(409,"Queue item is already running")
+    if q["status"] not in ("queued","failed"):
+        c.close(); raise HTTPException(409,f"Queue item cannot be forced from status {q['status']}")
+    c.execute("UPDATE queue SET status='queued',priority=1,error=NULL,finished_at=NULL,started_at=NULL,queued_at=? WHERE id=?",(now(),qid))
+    c.execute("UPDATE files SET status='pending',error=NULL WHERE id=?",(q["file_id"],))
+    c.commit(); c.close(); queue_event.set()
+    return {"ok":True,"forced":True}
 
 @app.get("/api/storage")
 async def storage():
