@@ -1213,6 +1213,32 @@ async def archive_move(body:dict):
     for src,target in resolved: shutil.move(str(src),str(target))
     return {"ok":True,"moved":[str(target.relative_to(DATA_DIR)) for _,target in resolved]}
 
+@app.post("/api/archive/copy")
+async def archive_copy(body:dict):
+    paths=body.get("paths") or []
+    destination=str(body.get("destination") or "").strip()
+    if not isinstance(paths,list) or not paths: raise HTTPException(400,"No archive items selected")
+    dest=archive_target(destination)
+    if not dest.is_dir(): raise HTTPException(400,"Destination folder does not exist")
+    resolved=[]
+    for rel in paths:
+        src=archive_target(str(rel))
+        if src == REPOS_DIR.resolve(): raise HTTPException(400,"Cannot copy archive root")
+        if not src.exists(): raise HTTPException(404,f"Archive item not found: {rel}")
+        if src.is_dir():
+            try: dest.relative_to(src)
+            except ValueError: pass
+            else: raise HTTPException(400,"Cannot copy a folder into itself")
+        target=dest/src.name
+        if target.exists(): raise HTTPException(409,f"Destination already contains: {src.name}")
+        resolved.append((src,target))
+    def run():
+        for src,target in resolved:
+            if src.is_dir(): shutil.copytree(src,target,ignore=shutil.ignore_patterns("*.part"))
+            else: shutil.copy2(src,target)
+    await asyncio.to_thread(run)
+    return {"ok":True,"copied":[str(t.relative_to(DATA_DIR)) for _,t in resolved]}
+
 @app.get("/download/{file_id}")
 async def download(file_id:int):
     f=await file_repo(file_id)
