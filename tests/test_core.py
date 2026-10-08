@@ -157,3 +157,25 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OldDatabaseTests(unittest.TestCase):
+    def test_old_queue_without_priority_is_migrated(self):
+        import sqlite3, importlib
+        d = tempfile.mkdtemp(prefix="github-archive-old-")
+        c = sqlite3.connect(os.path.join(d, "github_archive.sqlite3"))
+        c.executescript("""CREATE TABLE queue (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
+          status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+          queued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT);""")
+        c.commit(); c.close()
+        old_path, old_ready = main.DB_PATH, main.schema_ready
+        try:
+            from pathlib import Path
+            main.DB_PATH = Path(d) / "github_archive.sqlite3"; main.schema_ready = False
+            conn = main.db()
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(queue)")}
+            conn.close()
+            self.assertIn("priority", cols)
+            self.assertIsNone(main.claim_next_queue_item())
+        finally:
+            main.DB_PATH, main.schema_ready = old_path, old_ready
