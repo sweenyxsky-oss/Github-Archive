@@ -179,3 +179,23 @@ class OldDatabaseTests(unittest.TestCase):
             self.assertIsNone(main.claim_next_queue_item())
         finally:
             main.DB_PATH, main.schema_ready = old_path, old_ready
+
+
+class ArchiveDeleteStorageTests(unittest.TestCase):
+    def test_deleting_tracked_files_updates_storage(self):
+        c = main.db(); t = main.now()
+        c.execute("INSERT INTO repos(full_name,url,name,created_at,updated_at) VALUES('del/test','https://github.com/del/test','test',?,?)", (t, t))
+        rid = c.execute("SELECT id FROM repos WHERE full_name='del/test'").fetchone()["id"]
+        c.execute("INSERT INTO versions(repo_id,version,tag_name,kind,created_at,updated_at) VALUES(?,'v9','v9','release',?,?)", (rid, t, t))
+        vid = c.execute("SELECT id FROM versions WHERE repo_id=?", (rid,)).fetchone()["id"]
+        c.execute("INSERT INTO files(version_id,category,name,relative_path,source_url,status,size) VALUES(?,'release','a.bin','release/a.bin','x','complete',5)", (vid,))
+        c.commit(); c.close()
+        base = main.repo_dirs("del/test", "v9")[0]
+        (base / "release").mkdir(parents=True, exist_ok=True); (base / "release" / "a.bin").write_bytes(b"12345")
+        with TestClient(main.app) as client:
+            rel = str(base.relative_to(main.DATA_DIR))
+            self.assertEqual(client.post("/api/archive/delete", json={"paths": [rel]}).status_code, 200)
+            repo = [r for r in client.get("/api/repos").json() if r["full_name"] == "del/test"][0]
+            self.assertEqual(repo["archive_size"], 0)
+        c = main.db(); st = c.execute("SELECT status FROM files WHERE version_id=?", (vid,)).fetchone()["status"]; c.close()
+        self.assertEqual(st, "deleted")
