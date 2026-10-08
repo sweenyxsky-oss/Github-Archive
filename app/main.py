@@ -556,7 +556,7 @@ async def ensure_workers():
 async def archive_version(repo,version,info):
     await create_manifest(repo,version,info)
     # Version remains pending until its queue files are complete.
-    c=db(); total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(version["id"],)).fetchone()["n"]; done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='complete'",(version["id"],)).fetchone()["n"]
+    c=db(); total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(version["id"],)).fetchone()["n"]; done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status IN ('complete','deleted')",(version["id"],)).fetchone()["n"]
     if total==0: c.execute("UPDATE versions SET status='complete',error=NULL,updated_at=? WHERE id=?",(now(),version["id"]))
     elif done==total: c.execute("UPDATE versions SET status='complete',error=NULL,updated_at=? WHERE id=?",(now(),version["id"]))
     else: c.execute("UPDATE versions SET status='queued',updated_at=? WHERE id=?",(now(),version["id"]))
@@ -708,7 +708,7 @@ async def refresh_version_statuses():
     rows=c.execute("SELECT id FROM versions WHERE status IN ('queued','pending','failed')").fetchall()
     for r in rows:
         total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(r["id"],)).fetchone()["n"]
-        done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='complete'",(r["id"],)).fetchone()["n"]
+        done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status IN ('complete','deleted')",(r["id"],)).fetchone()["n"]
         failed=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='failed'",(r["id"],)).fetchone()["n"]
         status="complete" if done==total else ("failed" if failed else "queued")
         c.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
@@ -790,10 +790,22 @@ def recover_interrupted_queue():
     c.commit()
     c.close()
 
+def reconcile_missing_files():
+    """Files recorded as stored but no longer on disk (removed by hand or by an older version) stop counting as stored."""
+    c=db(); rows=c.execute("""SELECT f.id,f.relative_path,v.version,r.full_name FROM files f
+        JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id WHERE f.status='complete'""").fetchall()
+    gone=[f["id"] for f in rows if not (repo_dirs(f["full_name"],f["version"])[0]/f["relative_path"]).exists()]
+    for i in range(0,len(gone),500):
+        chunk=gone[i:i+500]; marks=",".join("?"*len(chunk))
+        c.execute(f"UPDATE files SET status='deleted',size=0,verify_status='deleted' WHERE id IN ({marks})",chunk)
+    c.commit(); c.close(); return len(gone)
+
 async def startup():
     global background_task,worker_tasks
     db().close()
     recover_interrupted_queue()
+    try: print(f"[startup] {reconcile_missing_files()} missing file(s) marked as deleted",flush=True)
+    except Exception as e: print(f"[startup] could not check for missing files: {e}",flush=True)
     worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]
     background_task=asyncio.create_task(scheduler())
 async def shutdown():
@@ -1071,6 +1083,8 @@ async def force_queue(qid:int):
 async def storage():
     c=db(); repo_count=c.execute("SELECT COUNT(*) n FROM repos").fetchone()["n"]; versions=c.execute("SELECT COUNT(*) n FROM versions").fetchone()["n"]
     files=c.execute("SELECT COUNT(*) n FROM files WHERE status='complete'").fetchone()["n"]; size=c.execute("SELECT COALESCE(SUM(size),0) n FROM files WHERE status='complete'").fetchone()["n"]; c.close()
+    # Measure what is really on disk, so deletions and copies in the archive browser are reflected.
+    if REPOS_DIR.exists(): size=await asyncio.to_thread(disk_usage,REPOS_DIR)
     st=os.statvfs(DATA_DIR); return {"archive_bytes":size,"free_bytes":st.f_bavail*st.f_frsize,"total_bytes":st.f_blocks*st.f_frsize,"repos":repo_count,"versions":versions,"files":files}
 
 @app.get("/api/storage/repos")
@@ -1178,10 +1192,34 @@ async def archive_delete(body:dict):
         target=archive_target(str(rel))
         if target == REPOS_DIR.resolve(): raise HTTPException(400,"Cannot delete archive root")
         if not target.exists(): continue
+        ids=tracked_ids_under(target)
         if target.is_dir(): shutil.rmtree(target)
         else: target.unlink()
+        if ids:
+            # Keep the records (so the files are not downloaded again) but stop counting them as stored.
+            c=db(); marks=",".join("?"*len(ids))
+            c.execute(f"UPDATE files SET status='deleted',size=0,progress_bytes=0,speed_bps=0,eta_seconds=NULL,verify_status='deleted' WHERE id IN ({marks})",ids)
+            c.execute(f"UPDATE queue SET status='done',finished_at=COALESCE(finished_at,?) WHERE file_id IN ({marks}) AND status<>'running'",[now()]+ids)
+            c.commit(); c.close()
         deleted.append(str(target.relative_to(DATA_DIR)))
     return {"ok":True,"deleted":deleted}
+
+def tracked_ids_under(src):
+    c=db(); rows=c.execute("""SELECT f.id,f.relative_path,v.version,r.full_name FROM files f
+        JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id""").fetchall(); c.close()
+    ids=[]
+    for f in rows:
+        p=(repo_dirs(f["full_name"],f["version"])[0]/f["relative_path"]).resolve()
+        if p==src or src in p.parents: ids.append(f["id"])
+    return ids
+
+def disk_usage(root):
+    total=0
+    for p in root.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink(): total+=p.stat().st_size
+        except OSError: pass
+    return total
 
 def tracked_under(src):
     c=db(); rows=c.execute("""SELECT f.relative_path,v.version,r.full_name FROM files f
