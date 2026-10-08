@@ -130,6 +130,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(c.execute("SELECT status FROM files WHERE id=?", (fid,)).fetchone()["status"], "pending")
         c.close()
 
+    def _seed_queue_item(self, queue_status="queued"):
+        c=main.db(); t=main.now()
+        c.execute("DELETE FROM repos")
+        c.execute("INSERT INTO repos(full_name,url,name,created_at,updated_at) VALUES('o/r','https://github.com/o/r','r',?,?)",(t,t))
+        rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.execute("INSERT INTO versions(repo_id,version,tag_name,kind,created_at,updated_at) VALUES(?,'v1','v1','release',?,?)",(rid,t,t))
+        vid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        main.upsert_file(c,vid,"source","a.zip","source/a.zip","https://example.invalid/a.zip")
+        fid=c.execute("SELECT id FROM files WHERE version_id=?",(vid,)).fetchone()[0]
+        c.execute("INSERT INTO queue(file_id,status,queued_at) VALUES(?,?,?)",(fid,queue_status,t))
+        qid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.commit(); c.close(); return qid
+
+    def test_queue_api_exposes_queue_id(self):
+        qid=self._seed_queue_item("failed")
+        with TestClient(main.app) as client:
+            items=client.get("/api/queue").json()["items"]
+            self.assertEqual(items[0]["queue_id"], qid)
+
+    def test_retry_rejects_running_item(self):
+        qid=self._seed_queue_item("queued")
+        c=main.db(); c.execute("UPDATE queue SET status='running' WHERE id=?",(qid,)); c.commit(); c.close()
+        with TestClient(main.app) as client:
+            self.assertEqual(client.post(f"/api/queue/{qid}/retry").status_code, 409)
 
 if __name__ == "__main__":
     unittest.main()
