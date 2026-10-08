@@ -7,6 +7,8 @@ import re
 import secrets
 import sqlite3
 import shutil
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -30,7 +32,15 @@ TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
-app = FastAPI(title="GitHub Archive", version="2.0.0")
+@asynccontextmanager
+async def lifespan(_app):
+    await startup()
+    try:
+        yield
+    finally:
+        await shutdown()
+
+app = FastAPI(title="GitHub Archive", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 @app.middleware("http")
@@ -41,7 +51,8 @@ async def admin_auth(request:Request, call_next):
         if not supplied or not hmac.compare_digest(supplied,ADMIN_TOKEN):
             return JSONResponse({"detail":"Admin authentication required"},status_code=401)
     return await call_next(request)
-check_lock = asyncio.Lock()
+repo_locks = defaultdict(asyncio.Lock)
+schema_ready = False
 background_task = None
 worker_tasks = []
 queue_event = asyncio.Event()
@@ -91,8 +102,12 @@ CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def db():
+    global schema_ready
+    c=sqlite3.connect(DB_PATH,timeout=30); c.row_factory=sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON"); c.execute("PRAGMA busy_timeout=30000")
+    if schema_ready: return c
     DATA_DIR.mkdir(parents=True, exist_ok=True); REPOS_DIR.mkdir(parents=True, exist_ok=True)
-    c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; c.execute("PRAGMA foreign_keys=ON"); c.executescript(SCHEMA)
+    c.execute("PRAGMA journal_mode=WAL"); c.executescript(SCHEMA)
     cols={r["name"] for r in c.execute("PRAGMA table_info(repos)").fetchall()}
     if "monitoring" not in cols: c.execute("ALTER TABLE repos ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1")
     if "archive_history" not in cols: c.execute("ALTER TABLE repos ADD COLUMN archive_history INTEGER NOT NULL DEFAULT 0")
@@ -102,7 +117,7 @@ def db():
     if "eta_seconds" not in fcols: c.execute("ALTER TABLE files ADD COLUMN eta_seconds REAL")
     defaults={"check_interval_minutes":str(DEFAULT_INTERVAL),"include_prereleases":str(DEFAULT_PRERELEASES).lower()}
     for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
-    c.commit(); return c
+    c.commit(); schema_ready=True; return c
 def rd(x): return dict(x) if x else None
 def safe_name(s): return re.sub(r"[^A-Za-z0-9._-]+","_",s).strip("._") or "unnamed"
 def parse_repo_url(url):
@@ -249,8 +264,13 @@ async def discover(repo, policy):
             chosen={"version":f"current-{sha[:12]}","tag_name":f"current-{sha[:12]}","kind":"current-source",
                     "published_at":branch_commit.get("commit",{}).get("committer",{}).get("date"),
                     "html_url":f"https://github.com/{repo}/tree/{sha}","sha":sha,"assets":[]}
-        chosen["default_branch"]=meta["default_branch"]
-        if tag_info: tag_info["default_branch"]=meta["default_branch"]
+        branch=meta.get("default_branch") or "main"
+        if chosen["kind"]=="current-source":
+            branch_sha=chosen["sha"]
+        else:
+            branch_sha=(await gh_json(client,api+"/commits/"+quote(branch,safe=""))).get("sha")
+        chosen["default_branch"]=branch; chosen["branch_sha"]=branch_sha
+        if tag_info: tag_info["default_branch"]=branch; tag_info["branch_sha"]=branch_sha
         return meta,(chosen,tag_info)
 
 def policy_for(repo):
@@ -273,6 +293,10 @@ def repo_dirs(full,version):
 
 def upsert_version(c,repo,info):
     t=now()
+    old=c.execute("SELECT id,target_sha FROM versions WHERE repo_id=? AND tag_name=?",(repo["id"],info["tag_name"])).fetchone()
+    if old and old["target_sha"] and info.get("sha") and old["target_sha"]!=info["sha"]:
+        c.execute("""UPDATE files SET status='pending',error=NULL,verify_status='unverified',progress_bytes=0
+                     WHERE version_id=? AND status!='downloading'""",(old["id"],))
     c.execute("""INSERT INTO versions(repo_id,version,tag_name,kind,published_at,html_url,target_sha,status,created_at,updated_at)
                  VALUES(?,?,?,?,?,?,?,'pending',?,?)
                  ON CONFLICT(repo_id,tag_name) DO UPDATE SET version=excluded.version,kind=excluded.kind,published_at=excluded.published_at,
@@ -329,7 +353,8 @@ async def create_manifest(repo,version,info,include_current=True):
         upsert_file(c,version["id"],"source",n,str(Path("source")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(version['tag_name'],safe='')}")
     if include_current and policy.get("current",True) and version["kind"]!="current-source":
         n=f"{safe_name(repo['name'])}-current-{safe_name(info['default_branch'])}.zip"
-        upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(info['default_branch'],safe='')}")
+        current_ref=info.get("branch_sha") or info["default_branch"]
+        upsert_file(c,version["id"],"repository-current",n,str(Path("repository-current")/n),f"https://api.github.com/repos/{repo['full_name']}/zipball/{quote(current_ref,safe='')}")
     if policy.get("artifacts",False) and version["target_sha"]:
         for a in artifact_items:
             name=f"{safe_name(a.get('name') or 'artifact')}-{a.get('id')}.zip"
@@ -344,6 +369,9 @@ async def create_manifest(repo,version,info,include_current=True):
 
     rows=c.execute("SELECT * FROM files WHERE version_id=?",(version["id"],)).fetchall()
     for f in rows: enqueue(c,f["id"])
+    c.execute("""UPDATE queue SET status='queued',error=NULL,finished_at=NULL,queued_at=?
+                 WHERE status IN ('done','failed') AND file_id IN
+                 (SELECT id FROM files WHERE version_id=? AND status='pending')""",(now(),version["id"]))
     c.commit()
     meta={"repository":repo["full_name"],"version":version["version"],"tag":version["tag_name"],"kind":version["kind"],"target_sha":version["target_sha"],
           "default_branch":info["default_branch"],"published_at":version["published_at"],"release_url":version["html_url"],
@@ -355,11 +383,6 @@ async def create_manifest(repo,version,info,include_current=True):
 
 async def download_one(f):
     file_id=f["file_id"]
-    progress_last_write=0.0
-    progress_started=asyncio.get_running_loop().time()
-    progress_base=0
-    speed_sample_time=progress_started
-    speed_sample_bytes=0
     base=repo_dirs(f["full_name"],f["version"])[0]
     target=(base/Path(f["relative_path"])).resolve()
     if not str(target).startswith(str(base.resolve())+os.sep):
@@ -367,7 +390,29 @@ async def download_one(f):
     part=target.with_name(target.name+".part")
     target.parent.mkdir(parents=True,exist_ok=True)
     expected=f["expected_size"]; digest=f["sha256"]
+    loop=asyncio.get_running_loop()
+
+    async def stream_to_part(resp,start):
+        if start and resp.status_code==200:
+            start=0; part.unlink(missing_ok=True)
+        if resp.status_code==416:
+            part.unlink(missing_ok=True)
+            raise RuntimeError("Download HTTP 416 (resume rejected; restarting)")
+        if resp.status_code>=400: raise RuntimeError(f"Download HTTP {resp.status_code}")
+        received=0; last_write=0.0; sample_t=loop.time(); sample_b=start
+        with part.open("ab" if start and resp.status_code==206 else "wb") as out:
+            async for chunk in resp.aiter_bytes(1024*1024):
+                out.write(chunk); received+=len(chunk)
+                tnow=loop.time()
+                if tnow-last_write>=0.5:
+                    total=start+received
+                    speed=max(0,(total-sample_b)/max(0.001,tnow-sample_t))
+                    eta=max(0,(expected-total)/speed) if expected and speed>0 else None
+                    c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total,speed,eta,file_id)); c.commit(); c.close()
+                    last_write=tnow; sample_t=tnow; sample_b=total
+
     try:
+        last_error=None
         for attempt in range(1,MAX_RETRIES+1):
             try:
                 start=part.stat().st_size if part.exists() else 0
@@ -383,59 +428,35 @@ async def download_one(f):
                             h={"User-Agent":"github-archive/2.0.0"}
                             if start: h["Range"]=f"bytes={start}-"
                             async with client.stream("GET",loc,headers=h,follow_redirects=True) as rr:
-                                if start and rr.status_code==200: start=0; part.unlink(missing_ok=True)
-                                if rr.status_code==416: part.unlink(missing_ok=True); continue
-                                if rr.status_code>=400: raise RuntimeError(f"Download HTTP {rr.status_code}")
-                                with part.open("ab" if start and rr.status_code==206 else "wb") as out:
-                                    async for chunk in rr.aiter_bytes(1024*1024):
-                                        out.write(chunk)
-                                        progress_base += len(chunk)
-                                        tnow=asyncio.get_running_loop().time()
-                                        if tnow-progress_last_write>=0.5:
-                                            total_bytes=start+progress_base
-                                            sample_elapsed=max(0.001,tnow-speed_sample_time)
-                                            speed=max(0,(total_bytes-speed_sample_bytes)/sample_elapsed)
-                                            eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
-                                            c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close()
-                                            progress_last_write=tnow
-                                            speed_sample_time=tnow
-                                            speed_sample_bytes=total_bytes
+                                await stream_to_part(rr,start)
                         else:
-                            if start and r.status_code==200: start=0; part.unlink(missing_ok=True)
-                            if r.status_code==416: part.unlink(missing_ok=True); continue
-                            if r.status_code>=400: raise RuntimeError(f"Download HTTP {r.status_code}")
-                            with part.open("ab" if start and r.status_code==206 else "wb") as out:
-                                async for chunk in r.aiter_bytes(1024*1024):
-                                    out.write(chunk)
-                                    progress_base += len(chunk)
-                                    tnow=asyncio.get_running_loop().time()
-                                    if tnow-progress_last_write>=0.5:
-                                        total_bytes=start+progress_base
-                                        sample_elapsed=max(0.001,tnow-speed_sample_time)
-                                        speed=max(0,(total_bytes-speed_sample_bytes)/sample_elapsed)
-                                        eta=max(0,(expected-total_bytes)/speed) if expected and speed>0 else None
-                                        c=db(); c.execute("UPDATE files SET progress_bytes=?,speed_bps=?,eta_seconds=? WHERE id=?",(total_bytes,speed,eta,file_id)); c.commit(); c.close()
-                                        progress_last_write=tnow
-                                        speed_sample_time=tnow
+                            await stream_to_part(r,start)
                 size=part.stat().st_size
-                if expected is not None and size!=expected: raise RuntimeError(f"Size mismatch: got {size}, expected {expected}")
+                if expected is not None and size!=expected:
+                    part.unlink(missing_ok=True)
+                    raise RuntimeError(f"Size mismatch: got {size}, expected {expected}")
                 h=hashlib.sha256()
                 with part.open("rb") as inp:
                     for block in iter(lambda:inp.read(1024*1024),b""): h.update(block)
                 actual=h.hexdigest()
                 if digest and digest.startswith("sha256:") and actual.lower()!=digest.split(":",1)[1].lower():
+                    part.unlink(missing_ok=True)
                     raise RuntimeError("SHA-256 digest mismatch")
-                part.replace(target)
                 c=db()
+                if not c.execute("SELECT 1 FROM files WHERE id=?",(file_id,)).fetchone():
+                    # Repository was deleted while downloading; discard the result.
+                    c.close(); part.unlink(missing_ok=True); return
+                part.replace(target)
                 c.execute("UPDATE files SET status='complete',size=?,downloaded_at=?,progress_bytes=?,speed_bps=0,eta_seconds=NULL,error=NULL,verify_status=? WHERE id=?",
                           (size,now(),size,"verified" if digest else "verified-local",file_id))
                 c.execute("UPDATE queue SET status='done',finished_at=?,error=NULL WHERE id=?",
                           (now(),f["queue_id"]))
                 c.commit(); c.close()
                 return
-            except Exception:
-                if attempt==MAX_RETRIES: raise
-                await asyncio.sleep(min(30,2**attempt))
+            except Exception as e:
+                last_error=e
+                if attempt<MAX_RETRIES: await asyncio.sleep(min(30,2**attempt))
+        raise last_error or RuntimeError("Download failed")
     except Exception as e:
         c=db()
         c.execute("UPDATE files SET status='failed',error=?,speed_bps=0,eta_seconds=NULL,verify_status='failed' WHERE id=?",(str(e)[:2000],file_id))
@@ -480,14 +501,19 @@ def claim_next_queue_item():
     finally:
         c.close()
 
+def claim_peek():
+    c=db(); r=c.execute("SELECT 1 FROM queue WHERE status='queued' LIMIT 1").fetchone(); c.close()
+    return bool(r)
+
 async def worker():
     while True:
         try:
             q=claim_next_queue_item()
             if not q:
+                queue_event.clear()
+                if claim_peek(): continue
                 try: await asyncio.wait_for(queue_event.wait(),timeout=10)
                 except asyncio.TimeoutError: pass
-                queue_event.clear()
                 continue
             try:
                 await download_one(q)
@@ -552,36 +578,39 @@ async def list_repo_releases(full_name, include_prereleases=True):
 async def import_repo_history(repo_id):
     c=db(); repo=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
     if not repo: return
-    try:
-        meta,_=await discover(repo["full_name"],{"prereleases":True})
-        releases=await list_repo_releases(repo["full_name"],True)
-        c=db()
-        c.execute("UPDATE repos SET name=?,default_branch=?,status='importing',error=NULL,updated_at=? WHERE id=?",
-                  (meta["name"],meta["default_branch"],now(),repo_id)); c.commit()
-        repo_now=dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone())
-        c.close()
-        for info in reversed(releases):
-            info["default_branch"]=meta["default_branch"]
-            c=db(); v=upsert_version(c,repo_now,info); c.commit(); known=c.execute(
-                "SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone(); c.close()
-            if known["status"]!="complete":
-                await create_manifest(repo_now,known,info,include_current=False)
-        if releases:
-            latest=releases[0]
-            latest["default_branch"]=meta["default_branch"]
-            c=db(); lv=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,latest["tag_name"])).fetchone(); c.close()
-            if lv: await create_manifest(repo_now,lv,latest,include_current=True)
-        c=db()
-        c.execute("UPDATE repos SET status='queued',latest_version=?,latest_kind='release',latest_date=?,latest_url=?,last_checked_at=?,updated_at=? WHERE id=?",
-                  ((releases[0]["version"] if releases else None),
-                   (releases[0]["published_at"] if releases else None),
-                   (releases[0]["html_url"] if releases else None),
-                   now(),now(),repo_id))
-        c.commit(); c.close(); queue_event.set()
-        if not releases:
-            await check_repo(repo_id)
-    except Exception as e:
-        c=db(); c.execute("UPDATE repos SET status='failed',error=?,updated_at=? WHERE id=?",(str(e)[:4000],now(),repo_id)); c.commit(); c.close()
+    run_latest_check=False
+    async with repo_locks[repo_id]:
+        try:
+            policy=policy_for(repo)
+            meta,(chosen0,_tag)=await discover(repo["full_name"],policy)
+            releases=await list_repo_releases(repo["full_name"],bool(policy.get("prereleases",False))) if policy.get("releases",True) else []
+            branch_sha=chosen0.get("branch_sha") if chosen0 else None
+            c=db()
+            c.execute("UPDATE repos SET name=?,default_branch=?,status='importing',error=NULL,updated_at=? WHERE id=?",
+                      (meta["name"],meta["default_branch"],now(),repo_id)); c.commit()
+            repo_now=dict(c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone())
+            c.close()
+            latest_tag=releases[0]["tag_name"] if releases else None
+            for info in reversed(releases):
+                info["default_branch"]=meta["default_branch"]; info["branch_sha"]=branch_sha
+                c=db(); upsert_version(c,repo_now,info); c.commit(); known=c.execute(
+                    "SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone(); c.close()
+                is_latest=info["tag_name"]==latest_tag
+                if known["status"]!="complete" or is_latest:
+                    await create_manifest(repo_now,known,info,include_current=is_latest)
+            c=db()
+            c.execute("UPDATE repos SET status='queued',latest_version=?,latest_kind='release',latest_date=?,latest_url=?,last_checked_at=?,updated_at=? WHERE id=?",
+                      ((releases[0]["version"] if releases else None),
+                       (releases[0]["published_at"] if releases else None),
+                       (releases[0]["html_url"] if releases else None),
+                       now(),now(),repo_id))
+            c.commit(); c.close(); queue_event.set()
+            run_latest_check=not releases
+        except Exception as e:
+            c=db(); c.execute("UPDATE repos SET status='failed',error=?,updated_at=? WHERE id=?",(str(e)[:4000],now(),repo_id)); c.commit(); c.close()
+    if run_latest_check:
+        try: await check_repo(repo_id)
+        except Exception: pass
 
 async def import_user(username, archive_all=True):
     try:
@@ -611,7 +640,7 @@ async def import_user(username, archive_all=True):
     return results
 
 async def check_repo(repo_id):
-    async with check_lock:
+    async with repo_locks[repo_id]:
         c=db(); repo=c.execute("SELECT * FROM repos WHERE id=?",(repo_id,)).fetchone(); c.close()
         if not repo: raise HTTPException(404,"Repository not found")
         try:
@@ -634,8 +663,7 @@ async def check_repo(repo_id):
             c.commit()
             known=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,info["tag_name"])).fetchone()
             c.close()
-            if known["status"]!="complete":
-                await create_manifest(repo_now,known,info)
+            await create_manifest(repo_now,known,info)
 
             if policy.get("mode")=="both" and tag_info and tag_info["tag_name"]!=info["tag_name"]:
                 c=db()
@@ -643,8 +671,7 @@ async def check_repo(repo_id):
                 c.commit()
                 known_tag=c.execute("SELECT * FROM versions WHERE repo_id=? AND tag_name=?",(repo_id,tag_info["tag_name"])).fetchone()
                 c.close()
-                if known_tag["status"]!="complete":
-                    await create_manifest(repo_now,known_tag,tag_info)
+                await create_manifest(repo_now,known_tag,tag_info,include_current=False)
 
             c=db()
             c.execute("UPDATE repos SET latest_version=?,latest_kind=?,latest_date=?,latest_url=?,last_checked_at=?,status='queued',error=NULL,updated_at=? WHERE id=?",
@@ -741,14 +768,12 @@ def recover_interrupted_queue():
     c.commit()
     c.close()
 
-@app.on_event("startup")
 async def startup():
     global background_task,worker_tasks
     db().close()
     recover_interrupted_queue()
     worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]
     background_task=asyncio.create_task(scheduler())
-@app.on_event("shutdown")
 async def shutdown():
     if background_task: background_task.cancel()
     for t in worker_tasks: t.cancel()
@@ -894,11 +919,13 @@ async def retry_repo(repo_id:int):
     return {"ok":True,"started":True,"mode":"latest"}
 @app.post("/api/check-all")
 async def check_all():
-    c=db(); ids=[r["id"] for r in c.execute("SELECT id FROM repos").fetchall()]; c.close(); results=[]
-    for rid in ids:
-        try: results.append(await check_repo(rid))
-        except Exception as e: results.append({"status":"failed","error":str(e)})
-    return results
+    c=db(); ids=[r["id"] for r in c.execute("SELECT id FROM repos").fetchall()]; c.close()
+    async def run():
+        for rid in ids:
+            try: await check_repo(rid)
+            except Exception: pass
+    asyncio.create_task(run())
+    return {"ok":True,"started":True,"count":len(ids)}
 
 @app.get("/api/repos/{repo_id}/versions")
 async def versions(repo_id:int):
@@ -952,7 +979,7 @@ async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
     c=db()
     total=c.execute("""SELECT COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where,params).fetchone()["n"]
     offset=(page-1)*page_size
-    rows=c.execute("""SELECT q.*,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
+    rows=c.execute("""SELECT q.*,q.id queue_id,f.name,f.category,f.size,f.expected_size,f.progress_bytes,f.speed_bps,f.eta_seconds,f.status file_status,v.version,r.full_name
       FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",params+[page_size,offset]).fetchall()
     c.close()
     return {"items":[rd(x) for x in rows],"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size),"sort":sort,"search":search}
@@ -961,6 +988,7 @@ async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
 async def retry_queue(qid:int):
     c=db(); q=c.execute("SELECT * FROM queue WHERE id=?",(qid,)).fetchone()
     if not q: c.close(); raise HTTPException(404,"Queue item not found")
+    if q["status"]=="running": c.close(); raise HTTPException(409,"Queue item is already running")
     c.execute("UPDATE queue SET status='queued',error=NULL,finished_at=NULL WHERE id=?",(qid,)); c.execute("UPDATE files SET status='pending',error=NULL WHERE id=?",(q["file_id"],)); c.commit(); c.close(); queue_event.set(); return {"ok":True}
 
 @app.post("/api/queue/{qid}/force")
@@ -1097,6 +1125,14 @@ async def archive_delete(body:dict):
         deleted.append(str(target.relative_to(DATA_DIR)))
     return {"ok":True,"deleted":deleted}
 
+def tracked_under(src):
+    c=db(); rows=c.execute("""SELECT f.relative_path,v.version,r.full_name FROM files f
+        JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id""").fetchall(); c.close()
+    for f in rows:
+        p=(repo_dirs(f["full_name"],f["version"])[0]/f["relative_path"]).resolve()
+        if p==src or src in p.parents: return True
+    return False
+
 @app.post("/api/archive/move")
 async def archive_move(body:dict):
     paths=body.get("paths") or []
@@ -1109,9 +1145,10 @@ async def archive_move(body:dict):
         src=archive_target(str(rel))
         if src == REPOS_DIR.resolve(): raise HTTPException(400,"Cannot move archive root")
         if not src.exists(): raise HTTPException(404,f"Archive item not found: {rel}")
-        try: src.relative_to(dest)
+        try: dest.relative_to(src)
         except ValueError: pass
         else: raise HTTPException(400,"Cannot move a folder into itself")
+        if tracked_under(src): raise HTTPException(409,f"{src.name} contains files tracked by the archive database and cannot be moved")
         target=dest/src.name
         if target.exists(): raise HTTPException(409,f"Destination already contains: {src.name}")
         resolved.append((src,target))
@@ -1150,9 +1187,6 @@ async def webhook(request:Request):
         return {"ok":True,"queued":False,"event":event}
     if event=="create" and payload.get("ref_type")!="tag":
         return {"ok":True,"queued":False,"event":event}
-    repo=payload.get("repository",{}).get("full_name")
-    if not repo: return {"ok":True,"queued":False}
-    c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
     repo=payload.get("repository",{}).get("full_name")
     if not repo: return {"ok":True,"queued":False}
     c=db(); r=c.execute("SELECT id,monitoring FROM repos WHERE full_name=?",(repo,)).fetchone(); c.close()
