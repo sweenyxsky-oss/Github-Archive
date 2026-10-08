@@ -100,6 +100,20 @@ CREATE INDEX IF NOT EXISTS idx_files_version ON files(version_id);
 CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
 """
 
+MIGRATION_COLUMNS = [
+ ("repos","group_id","INTEGER REFERENCES groups(id) ON DELETE SET NULL"),
+ ("repos","policy","""TEXT NOT NULL DEFAULT '{"releases":true,"assets":true,"source":true,"current":true,"tags":true,"artifacts":false,"commits":false,"prereleases":false}'"""),
+ ("repos","monitoring","INTEGER NOT NULL DEFAULT 1"),
+ ("repos","archive_history","INTEGER NOT NULL DEFAULT 0"),
+ ("files","verify_status","TEXT DEFAULT 'unverified'"),
+ ("files","progress_bytes","INTEGER NOT NULL DEFAULT 0"),
+ ("files","speed_bps","REAL NOT NULL DEFAULT 0"),
+ ("files","eta_seconds","REAL"),
+ ("queue","priority","INTEGER NOT NULL DEFAULT 0"),
+]
+active_downloads = set()
+worker_state = {"last_error":None,"last_error_at":None,"last_ok_at":None}
+
 def now(): return datetime.now(timezone.utc).isoformat()
 def db():
     global schema_ready
@@ -108,13 +122,11 @@ def db():
     if schema_ready: return c
     DATA_DIR.mkdir(parents=True, exist_ok=True); REPOS_DIR.mkdir(parents=True, exist_ok=True)
     c.execute("PRAGMA journal_mode=WAL"); c.executescript(SCHEMA)
-    cols={r["name"] for r in c.execute("PRAGMA table_info(repos)").fetchall()}
-    if "monitoring" not in cols: c.execute("ALTER TABLE repos ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1")
-    if "archive_history" not in cols: c.execute("ALTER TABLE repos ADD COLUMN archive_history INTEGER NOT NULL DEFAULT 0")
-    fcols={r["name"] for r in c.execute("PRAGMA table_info(files)").fetchall()}
-    if "progress_bytes" not in fcols: c.execute("ALTER TABLE files ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
-    if "speed_bps" not in fcols: c.execute("ALTER TABLE files ADD COLUMN speed_bps REAL NOT NULL DEFAULT 0")
-    if "eta_seconds" not in fcols: c.execute("ALTER TABLE files ADD COLUMN eta_seconds REAL")
+    # Databases created by older versions miss columns added later; CREATE TABLE
+    # IF NOT EXISTS never adds them, so add every missing column explicitly.
+    for table,col,ddl in MIGRATION_COLUMNS:
+        existing={r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in existing: c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     defaults={"check_interval_minutes":str(DEFAULT_INTERVAL),"include_prereleases":str(DEFAULT_PRERELEASES).lower()}
     for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
     c.commit(); schema_ready=True; return c
@@ -381,6 +393,12 @@ async def create_manifest(repo,version,info,include_current=True):
     meta_tmp.replace(base/"metadata.json")
     c.close(); return base
 
+def sha256_file(path):
+    h=hashlib.sha256()
+    with path.open("rb") as inp:
+        for block in iter(lambda:inp.read(1024*1024),b""): h.update(block)
+    return h.hexdigest()
+
 async def download_one(f):
     file_id=f["file_id"]
     base=repo_dirs(f["full_name"],f["version"])[0]
@@ -435,10 +453,7 @@ async def download_one(f):
                 if expected is not None and size!=expected:
                     part.unlink(missing_ok=True)
                     raise RuntimeError(f"Size mismatch: got {size}, expected {expected}")
-                h=hashlib.sha256()
-                with part.open("rb") as inp:
-                    for block in iter(lambda:inp.read(1024*1024),b""): h.update(block)
-                actual=h.hexdigest()
+                actual=await asyncio.to_thread(sha256_file,part)
                 if digest and digest.startswith("sha256:") and actual.lower()!=digest.split(":",1)[1].lower():
                     part.unlink(missing_ok=True)
                     raise RuntimeError("SHA-256 digest mismatch")
@@ -515,14 +530,21 @@ async def worker():
                 try: await asyncio.wait_for(queue_event.wait(),timeout=10)
                 except asyncio.TimeoutError: pass
                 continue
+            active_downloads.add(q["queue_id"])
             try:
                 await download_one(q)
-            except Exception:
-                pass
+                worker_state["last_ok_at"]=now()
+            except Exception as e:
+                print(f"[worker] download failed for {q.get('full_name')} / {q.get('name')}: {e}",flush=True)
+            finally:
+                active_downloads.discard(q["queue_id"])
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await asyncio.sleep(2)
+        except Exception as e:
+            # Never fail silently: a broken queue query used to stop all downloads with no trace.
+            worker_state["last_error"]=f"{type(e).__name__}: {e}"[:500]; worker_state["last_error_at"]=now()
+            print(f"[worker] queue error: {worker_state['last_error']}",flush=True)
+            await asyncio.sleep(5)
 
 async def ensure_workers():
     global worker_tasks
@@ -950,19 +972,55 @@ async def queue_status():
     return {"queued":counts.get("queued",0),"running":counts.get("running",0),
             "done":counts.get("done",0),"failed":counts.get("failed",0),
             "oldest_queued_at":queued,"oldest_running_at":running,
-            "inconsistent_complete_queued":broken,"workers":WORKERS}
+            "inconsistent_complete_queued":broken,"workers":WORKERS,
+            "workers_alive":sum(1 for t in worker_tasks if not t.done()),"active_downloads":len(active_downloads),
+            "worker_error":worker_state["last_error"],"worker_error_at":worker_state["last_error_at"]}
 
 @app.post("/api/queue/recover")
 async def recover_queue():
     c=db()
-    stale=c.execute("""UPDATE queue SET status='queued',started_at=NULL,error='Recovered stale running item'
-                       WHERE status='running' AND started_at IS NOT NULL
-                       AND (julianday('now')-julianday(started_at))*86400 > 1800""").rowcount
+    # Items marked running that no worker in this process is handling are orphaned
+    # (crash, restart, old bug) and can safely be queued again right away.
+    running=[r["id"] for r in c.execute("SELECT id FROM queue WHERE status='running'").fetchall()]
+    orphaned=[q for q in running if q not in active_downloads]
+    for qid in orphaned:
+        c.execute("UPDATE queue SET status='queued',started_at=NULL,error='Recovered orphaned running item' WHERE id=? AND status='running'",(qid,))
+        c.execute("UPDATE files SET status='pending',speed_bps=0,eta_seconds=NULL WHERE id=(SELECT file_id FROM queue WHERE id=?) AND status='downloading'",(qid,))
     fixed=c.execute("""UPDATE queue SET status='done',finished_at=COALESCE(finished_at,?)
                        WHERE status='queued' AND file_id IN
                        (SELECT id FROM files WHERE status='complete')""",(now(),)).rowcount
-    c.commit(); c.close(); await ensure_workers()
-    return {"ok":True,"requeued_stale":stale,"completed_inconsistent":fixed}
+    c.commit(); c.close()
+    dead=sum(1 for t in worker_tasks if t.done())
+    worker_state["last_error"]=None; worker_state["last_error_at"]=None
+    await ensure_workers()
+    return {"ok":True,"requeued_stale":len(orphaned),"completed_inconsistent":fixed,"workers_restarted":dead}
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """Per-repository queue health, to spot a repository that keeps failing or blocks the queue."""
+    c=db()
+    rows=c.execute("""SELECT r.id repo_id,r.full_name,r.status repo_status,r.error repo_error,
+        SUM(q.status='queued') queued,SUM(q.status='running') running,SUM(q.status='failed') failed,
+        SUM(q.status='done') done,MAX(q.attempts) max_attempts,
+        SUM(COALESCE(f.expected_size,0)*(q.status IN ('queued','running'))) pending_bytes
+        FROM repos r LEFT JOIN versions v ON v.repo_id=r.id LEFT JOIN files f ON f.version_id=v.id
+        LEFT JOIN queue q ON q.file_id=f.id GROUP BY r.id""").fetchall()
+    repos=[]
+    for r in rows:
+        d=rd(r)
+        for k in ("queued","running","failed","done","max_attempts","pending_bytes"): d[k]=d[k] or 0
+        d["errors"]=[rd(e) for e in c.execute("""SELECT q.error,COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id
+            JOIN versions v ON v.id=f.version_id WHERE v.repo_id=? AND q.status='failed' AND q.error IS NOT NULL
+            GROUP BY q.error ORDER BY n DESC LIMIT 3""",(r["repo_id"],)).fetchall()]
+        d["running_items"]=[rd(x) for x in c.execute("""SELECT q.id queue_id,f.name,q.started_at,f.progress_bytes,f.expected_size,f.speed_bps
+            FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id
+            WHERE v.repo_id=? AND q.status='running'""",(r["repo_id"],)).fetchall()]
+        score=d["failed"]*10+d["max_attempts"]*2+(50 if d["repo_status"]=="error" else 0)+(d["running"]*5 if d["running_items"] and all((x["speed_bps"] or 0)==0 for x in d["running_items"]) else 0)
+        d["problem_score"]=score; repos.append(d)
+    c.close()
+    repos.sort(key=lambda x:(-x["problem_score"],-x["queued"]))
+    return {"repos":repos,"worker_error":worker_state["last_error"],"workers_alive":sum(1 for t in worker_tasks if not t.done()),
+            "active_downloads":len(active_downloads),"rate_limit":github_rate_status()}
 
 @app.get("/api/queue")
 async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
