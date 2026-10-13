@@ -22,6 +22,41 @@ from pydantic import BaseModel
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
 DB_PATH = DATA_DIR / "github_archive.sqlite3"
 REPOS_DIR = DATA_DIR / "repos"
+QUEUE_HISTORY_DB_PATH = DATA_DIR / "queue_history.sqlite3"
+
+def history_db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    h=sqlite3.connect(QUEUE_HISTORY_DB_PATH,timeout=30); h.row_factory=sqlite3.Row
+    h.execute("PRAGMA journal_mode=WAL")
+    h.execute("""CREATE TABLE IF NOT EXISTS queue_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, queue_id INTEGER, file_id INTEGER, repo_name TEXT, version TEXT,
+        file_name TEXT, category TEXT, size INTEGER, status TEXT, queued_at TEXT, started_at TEXT,
+        finished_at TEXT, attempts INTEGER, error TEXT, archived_at TEXT NOT NULL)""")
+    return h
+
+def record_queue_history(queue_ids):
+    """Copy finished queue rows into the separate history file (whole-queue record)."""
+    if not queue_ids: return
+    try:
+        c=db(); marks=",".join("?"*len(queue_ids))
+        rows=c.execute(f"""SELECT q.*,f.name file_name,f.category,f.size,v.version,r.full_name repo_name
+            FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id
+            WHERE q.id IN ({marks})""",list(queue_ids)).fetchall(); c.close()
+        h=history_db(); ts=now()
+        for it in rows:
+            h.execute("""INSERT INTO queue_history(queue_id,file_id,repo_name,version,file_name,category,size,status,queued_at,started_at,finished_at,attempts,error,archived_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(it["id"],it["file_id"],it["repo_name"],it["version"],it["file_name"],it["category"],it["size"],
+                it["status"],it["queued_at"],it["started_at"],it["finished_at"],it["attempts"],it["error"],ts))
+        h.commit(); h.close()
+    except Exception as e:
+        print(f"[queue_history] record error: {e}",flush=True)
+
+def sync_queue_history():
+    h=history_db(); known={r[0] for r in h.execute("SELECT DISTINCT queue_id FROM queue_history WHERE status='done'")}; h.close()
+    c=db(); ids=[r["id"] for r in c.execute("SELECT id FROM queue WHERE status='done'")]; c.close()
+    missing=[i for i in ids if i not in known]
+    for i in range(0,len(missing),500): record_queue_history(missing[i:i+500])
+    return len(missing)
 DEFAULT_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL_MINUTES", "360")))
 DEFAULT_PRERELEASES = os.getenv("INCLUDE_PRERELEASES", "false").lower() == "true"
 MAX_RETRIES = max(1, int(os.getenv("MAX_DOWNLOAD_RETRIES", "4")))
@@ -467,6 +502,7 @@ async def download_one(f):
                 c.execute("UPDATE queue SET status='done',finished_at=?,error=NULL WHERE id=?",
                           (now(),f["queue_id"]))
                 c.commit(); c.close()
+                record_queue_history([f["queue_id"]])
                 return
             except Exception as e:
                 last_error=e
@@ -477,6 +513,7 @@ async def download_one(f):
         c.execute("UPDATE files SET status='failed',error=?,speed_bps=0,eta_seconds=NULL,verify_status='failed' WHERE id=?",(str(e)[:2000],file_id))
         c.execute("UPDATE queue SET status='failed',finished_at=?,error=? WHERE id=?",(now(),str(e)[:2000],f["queue_id"]))
         c.commit(); c.close()
+        record_queue_history([f["queue_id"]])
         raise
 
 
@@ -804,6 +841,8 @@ async def startup():
     global background_task,worker_tasks
     db().close()
     recover_interrupted_queue()
+    try: print(f"[startup] {sync_queue_history()} finished queue item(s) copied to queue history",flush=True)
+    except Exception as e: print(f"[startup] queue history sync failed: {e}",flush=True)
     try: print(f"[startup] {reconcile_missing_files()} missing file(s) marked as deleted",flush=True)
     except Exception as e: print(f"[startup] could not check for missing files: {e}",flush=True)
     worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]
@@ -836,6 +875,30 @@ async def github_rate_limit():
         "updated_at":now(),
     })
     return github_rate_status()
+
+@app.post("/api/releases/purge")
+async def purge_old_releases(body:dict|None=None):
+    keep=max(1,int((body or {}).get("keep",2)))
+    c=db(); repos_=c.execute("SELECT id,full_name FROM repos").fetchall()
+    purged=0; files_n=0; freed=0
+    for repo in repos_:
+        vs=c.execute("""SELECT * FROM versions WHERE repo_id=? AND kind<>'current-source'
+            ORDER BY COALESCE(published_at,created_at) DESC,id DESC""",(repo["id"],)).fetchall()
+        for v in vs[keep:]:
+            fs=c.execute("SELECT f.id,f.size,q.status qstatus FROM files f LEFT JOIN queue q ON q.file_id=f.id WHERE f.version_id=? AND f.status<>'deleted'",(v["id"],)).fetchall()
+            if not fs: continue
+            if any(f["qstatus"]=="running" for f in fs): continue
+            try:
+                d=repo_dirs(repo["full_name"],v["version"])[0]
+                if d.exists(): freed+=disk_usage(d); shutil.rmtree(d,ignore_errors=True)
+            except Exception as e: print(f"[purge] {repo['full_name']} {v['version']}: {e}",flush=True)
+            ids=[f["id"] for f in fs]; marks=",".join("?"*len(ids))
+            c.execute(f"UPDATE files SET status='deleted',size=0,progress_bytes=0,speed_bps=0,eta_seconds=NULL,verify_status='deleted' WHERE id IN ({marks})",ids)
+            c.execute(f"UPDATE queue SET status='done',finished_at=COALESCE(finished_at,?) WHERE file_id IN ({marks}) AND status<>'running'",[now()]+ids)
+            c.execute("UPDATE versions SET status='complete',updated_at=? WHERE id=?",(now(),v["id"]))
+            purged+=1; files_n+=len(ids)
+    c.commit(); c.close()
+    return {"ok":True,"keep":keep,"purged_versions":purged,"purged_files":files_n,"freed_bytes":freed}
 
 @app.get("/api/settings")
 async def settings():
@@ -1035,7 +1098,7 @@ async def diagnostics():
             "active_downloads":len(active_downloads),"rate_limit":github_rate_status()}
 
 @app.get("/api/queue")
-async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
+async def queue(page:int=1,page_size:int=25,search:str="",sort:str="id-desc",view:str="all"):
     page=max(1,page); page_size=min(100,max(1,page_size)); search=search.strip().lower()
     sort_map={"id-asc":"q.id ASC","id-desc":"q.id DESC","queued-asc":"q.queued_at ASC","queued-desc":"q.queued_at DESC",
               "started-asc":"q.started_at ASC","started-desc":"q.started_at DESC","status-asc":"f.status ASC","status-desc":"f.status DESC",
@@ -1043,9 +1106,11 @@ async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
               "repo-desc":"r.full_name COLLATE NOCASE DESC","file-asc":"f.name COLLATE NOCASE ASC","file-desc":"f.name COLLATE NOCASE DESC","category-asc":"f.category COLLATE NOCASE ASC","category-desc":"f.category COLLATE NOCASE DESC",
               "progress-asc":"COALESCE(f.progress_bytes,0) ASC","progress-desc":"COALESCE(f.progress_bytes,0) DESC","speed-asc":"COALESCE(f.speed_bps,0) ASC","speed-desc":"COALESCE(f.speed_bps,0) DESC",
               "eta-asc":"COALESCE(f.eta_seconds,999999999) ASC","eta-desc":"COALESCE(f.eta_seconds,999999999) DESC"}
-    order=sort_map.get(sort,"q.id DESC")+", q.id DESC"; where=""; params=[]
+    order=sort_map.get(sort,"q.id DESC")+", q.id DESC"; clauses=[]; params=[]
+    if view=="active": clauses.append("q.status<>'done' AND f.status NOT IN ('complete','deleted')")
     if search:
-        like=f"%{search}%"; where="WHERE lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"; params.append(like)
+        clauses.append("lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"); params.append(f"%{search}%")
+    where=("WHERE "+" AND ".join(clauses)+" ") if clauses else ""
     c=db()
     total=c.execute("""SELECT COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where,params).fetchone()["n"]
     offset=(page-1)*page_size
@@ -1053,6 +1118,23 @@ async def queue(page:int=1,page_size:int=50,search:str="",sort:str="id-desc"):
       FROM queue q JOIN files f ON f.id=q.file_id JOIN versions v ON v.id=f.version_id JOIN repos r ON r.id=v.repo_id """+where+" ORDER BY "+order+" LIMIT ? OFFSET ?",params+[page_size,offset]).fetchall()
     c.close()
     return {"items":[rd(x) for x in rows],"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size),"sort":sort,"search":search}
+
+@app.get("/api/queue/history")
+async def queue_history(page:int=1,page_size:int=25,search:str=""):
+    page=max(1,page); page_size=min(100,max(1,page_size)); search=search.strip().lower()
+    where=""; params=[]
+    if search: where="WHERE lower(COALESCE(repo_name,'')||' '||COALESCE(file_name,'')||' '||COALESCE(status,'')) LIKE ? "; params.append(f"%{search}%")
+    h=history_db(); total=h.execute("SELECT COUNT(*) n FROM queue_history "+where,params).fetchone()["n"]
+    rows=h.execute("SELECT * FROM queue_history "+where+"ORDER BY id DESC LIMIT ? OFFSET ?",params+[page_size,(page-1)*page_size]).fetchall(); h.close()
+    return {"items":[dict(r) for r in rows],"page":page,"page_size":page_size,"total":total}
+
+@app.get("/api/repos/latest")
+async def latest_repos(page:int=1,page_size:int=25):
+    page=max(1,page); page_size=min(100,max(1,page_size)); c=db()
+    total=c.execute("SELECT COUNT(*) n FROM repos").fetchone()["n"]
+    rows=c.execute("""SELECT id,full_name,status,created_at,latest_version,latest_url FROM repos
+        ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?""",(page_size,(page-1)*page_size)).fetchall(); c.close()
+    return {"items":[rd(r) for r in rows],"page":page,"page_size":page_size,"total":total}
 
 @app.post("/api/queue/{qid}/retry")
 async def retry_queue(qid:int):
@@ -1158,7 +1240,12 @@ def archive_entry(x):
     else:
         try: size=x.stat().st_size
         except OSError: size=0
-    return {"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":size}
+    created_at=None
+    try:
+        st=x.stat(); ts=getattr(st,"st_birthtime",None) or min(st.st_mtime,st.st_ctime)
+        created_at=datetime.fromtimestamp(ts,tz=timezone.utc).isoformat()
+    except (OSError,ValueError,OverflowError): pass
+    return {"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":size,"created_at":created_at}
 
 def archive_target(path):
     target=(DATA_DIR/path).resolve()

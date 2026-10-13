@@ -220,6 +220,35 @@
       text-decoration: none;
     }
     .btn:hover { background: var(--accent2); border-color: var(--accent2); text-decoration: none; }
+    .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    .table-wrap table { min-width: 640px; }
+    .table-wrap th, .table-wrap td { white-space: nowrap; }
+    .table-wrap td small { white-space: normal; display:block; min-width:180px; }
+    .stat b { display:block; }
+    .pager { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-top:12px; }
+    .gh-btn { display:inline-flex; align-items:center; justify-content:center; width:30px; height:30px; border:1px solid var(--line); border-radius:6px; color:var(--text); }
+    .gh-btn:hover { border-color:var(--accent); color:var(--accent); }
+    button.danger { border-color: var(--failed); color: var(--failed); }
+    button.danger:hover { background: var(--failed); color: var(--bg); }
+    @media (max-width: 900px) {
+      .container { padding: 12px; }
+      .card, .stat { padding: 14px; }
+      th, td { padding: 8px; font-size: 14px; }
+    }
+    @media (max-width: 600px) {
+      .nav { flex-wrap: nowrap; overflow-x: auto; padding: 10px; -webkit-overflow-scrolling: touch; }
+      .nav button { flex: 0 0 auto; padding: 8px 12px; }
+      .container { padding: 8px; }
+      .card, .stat { padding: 12px; margin: 10px 0; border-radius: 6px; }
+      .grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+      .toolbar input { min-width: 0; width: 100%; flex-basis: 100%; }
+      .toolbar button { flex: 1 1 auto; }
+      th, td { padding: 6px 8px; font-size: 13px; }
+      h2 { font-size: 20px; }
+      label { display:block; }
+      input, select, textarea { max-width: 100%; }
+      .modal { padding: 16px; }
+    }
   </style>
 </head>
 <body>
@@ -240,6 +269,6 @@
     <div id="activity" style="display:none"></div>
   </div>
 
-  <script src="/static/app.js?v=20261008-queue-final" defer></script>
+  <script src="/static/app.js?v=20261012-updates" defer></script>
 </body>
 </html>
