@@ -80,9 +80,11 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 
 @app.middleware("http")
 async def admin_auth(request:Request, call_next):
-    if ADMIN_TOKEN and request.url.path.startswith("/api/") and request.url.path != "/api/webhook":
+    if ADMIN_TOKEN and (request.url.path.startswith("/api/") or request.url.path.startswith("/download/")) and request.url.path != "/api/webhook":
         auth=request.headers.get("authorization","")
         supplied=auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-archive-token","").strip()
+        if not supplied and request.url.path.startswith("/download/"):
+            supplied=request.query_params.get("token","").strip()
         if not supplied or not hmac.compare_digest(supplied,ADMIN_TOKEN):
             return JSONResponse({"detail":"Admin authentication required"},status_code=401)
     return await call_next(request)
@@ -90,8 +92,43 @@ repo_locks = defaultdict(asyncio.Lock)
 schema_ready = False
 background_task = None
 worker_tasks = []
-queue_event = asyncio.Event()
-api_request_lock = asyncio.Lock()
+_raw_queue_event = None
+_raw_api_request_lock = None
+
+def get_queue_event():
+    global _raw_queue_event
+    try: loop = asyncio.get_running_loop()
+    except RuntimeError: loop = None
+    if _raw_queue_event is None or getattr(_raw_queue_event, "_loop", None) is not loop:
+        _raw_queue_event = asyncio.Event()
+    return _raw_queue_event
+
+def get_api_request_lock():
+    global _raw_api_request_lock
+    try: loop = asyncio.get_running_loop()
+    except RuntimeError: loop = None
+    if _raw_api_request_lock is None or getattr(_raw_api_request_lock, "_loop", None) is not loop:
+        _raw_api_request_lock = asyncio.Lock()
+    return _raw_api_request_lock
+
+class _QueueEventProxy:
+    def set(self): return get_queue_event().set()
+    def clear(self): return get_queue_event().clear()
+    def is_set(self): return get_queue_event().is_set()
+    def wait(self): return get_queue_event().wait()
+
+class _ApiLockProxy:
+    def __init__(self): self._lock = None
+    async def __aenter__(self):
+        self._lock = get_api_request_lock()
+        await self._lock.acquire()
+        return self._lock
+    async def __aexit__(self, exc_type, exc, tb):
+        self._lock.release()
+        self._lock = None
+
+queue_event = _QueueEventProxy()
+api_request_lock = _ApiLockProxy()
 api_next_request_at = 0.0
 api_rate_state = {"limit":None,"remaining":None,"reset":None,"authenticated":bool(TOKEN),"updated_at":None}
 
@@ -150,6 +187,16 @@ active_downloads = set()
 worker_state = {"last_error":None,"last_error_at":None,"last_ok_at":None}
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+def parse_iso_utc(val: str | None) -> datetime | None:
+    if not val or val == "never": return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
 def db():
     global schema_ready
     c=sqlite3.connect(DB_PATH,timeout=30); c.row_factory=sqlite3.Row
@@ -677,6 +724,10 @@ async def import_user(username, archive_all=True):
     except Exception:
         raise
     results=[]
+    sem=asyncio.Semaphore(2)
+    async def run_with_sem(coro):
+        async with sem:
+            await coro
     for item in items:
         full=item.get("full_name")
         if not full: continue
@@ -692,9 +743,9 @@ async def import_user(username, archive_all=True):
             c.commit()
         c.close()
         if archive_all:
-            asyncio.create_task(import_repo_history(rid))
+            asyncio.create_task(run_with_sem(import_repo_history(rid)))
         else:
-            asyncio.create_task(check_repo(rid))
+            asyncio.create_task(run_with_sem(check_repo(rid)))
         results.append({"id":rid,"full_name":full})
     return results
 
@@ -733,60 +784,92 @@ async def check_repo(repo_id):
                 await create_manifest(repo_now,known_tag,tag_info,include_current=False)
 
             c=db()
-            c.execute("UPDATE repos SET latest_version=?,latest_kind=?,latest_date=?,latest_url=?,last_checked_at=?,status='queued',error=NULL,updated_at=? WHERE id=?",
-                      (info["version"],info["kind"],info["published_at"],info["html_url"],now(),now(),repo_id))
+            active_q = c.execute("""SELECT COUNT(*) n FROM queue q
+                                    JOIN files f ON f.id=q.file_id
+                                    JOIN versions v ON v.id=f.version_id
+                                    WHERE v.repo_id=? AND q.status IN ('queued','running')""",(repo_id,)).fetchone()["n"]
+            repo_status = "queued" if active_q > 0 else "complete"
+            c.execute("UPDATE repos SET latest_version=?,latest_kind=?,latest_date=?,latest_url=?,last_checked_at=?,status=?,error=NULL,updated_at=? WHERE id=?",
+                      (info["version"],info["kind"],info["published_at"],info["html_url"],now(),repo_status,now(),repo_id))
             c.commit(); c.close(); queue_event.set()
-            return {"status":"queued","version":info["version"],"kind":info["kind"]}
+            return {"status":repo_status,"version":info["version"],"kind":info["kind"]}
         except Exception as e:
             c=db(); c.execute("UPDATE repos SET status='failed',error=?,last_checked_at=?,updated_at=? WHERE id=?",(str(e)[:4000],now(),now(),repo_id)); c.commit(); c.close(); raise
 
 async def refresh_version_statuses():
     c=db()
-    rows=c.execute("SELECT id FROM versions WHERE status IN ('queued','pending','failed')").fetchall()
+    rows=c.execute("SELECT id FROM versions").fetchall()
     for r in rows:
-        total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(r["id"],)).fetchone()["n"]
-        done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status IN ('complete','deleted')",(r["id"],)).fetchone()["n"]
-        failed=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='failed'",(r["id"],)).fetchone()["n"]
-        status="complete" if done==total else ("failed" if failed else "queued")
-        c.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
+        vid=r["id"]
+        total=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=?",(vid,)).fetchone()["n"]
+        done=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status IN ('complete','deleted')",(vid,)).fetchone()["n"]
+        failed=c.execute("SELECT COUNT(*) n FROM files WHERE version_id=? AND status='failed'",(vid,)).fetchone()["n"]
+        active_q=c.execute("""SELECT COUNT(*) n FROM queue q JOIN files f ON f.id=q.file_id
+                              WHERE f.version_id=? AND q.status IN ('queued','running')""",(vid,)).fetchone()["n"]
+        if total > 0 and done >= total:
+            status = "complete"
+        elif active_q > 0:
+            status = "queued"
+        elif failed > 0:
+            status = "failed"
+        elif total > 0:
+            status = "pending"
+        else:
+            status = "complete"
+        c.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?",(status,now(),vid))
     c.commit(); c.close()
 
 async def refresh_repo_statuses():
     c=db()
     rows=c.execute("SELECT id FROM repos").fetchall()
     for r in rows:
+        rid=r["id"]
         total=c.execute("""SELECT COUNT(*) n FROM files f
                            JOIN versions v ON v.id=f.version_id
-                           WHERE v.repo_id=?""",(r["id"],)).fetchone()["n"]
+                           WHERE v.repo_id=?""",(rid,)).fetchone()["n"]
         done=c.execute("""SELECT COUNT(*) n FROM files f
                           JOIN versions v ON v.id=f.version_id
-                          WHERE v.repo_id=? AND f.status='complete'""",(r["id"],)).fetchone()["n"]
+                          WHERE v.repo_id=? AND f.status IN ('complete','deleted')""",(rid,)).fetchone()["n"]
         failed=c.execute("""SELECT COUNT(*) n FROM files f
                             JOIN versions v ON v.id=f.version_id
-                            WHERE v.repo_id=? AND f.status='failed'""",(r["id"],)).fetchone()["n"]
-        if total and done==total:
-            status="complete"
-        elif failed:
-            status="failed"
-        elif total:
-            status="queued"
+                            WHERE v.repo_id=? AND f.status='failed'""",(rid,)).fetchone()["n"]
+        active_q=c.execute("""SELECT COUNT(*) n FROM queue q
+                              JOIN files f ON f.id=q.file_id
+                              JOIN versions v ON v.id=f.version_id
+                              WHERE v.repo_id=? AND q.status IN ('queued','running')""",(rid,)).fetchone()["n"]
+        if active_q > 0:
+            status = "queued"
+        elif total > 0 and done >= total:
+            status = "complete"
+        elif failed > 0:
+            status = "failed"
+        elif total > 0:
+            status = "complete"
         else:
-            status=c.execute("SELECT status FROM repos WHERE id=?",(r["id"],)).fetchone()["status"]
-        c.execute("UPDATE repos SET status=?,updated_at=? WHERE id=?",(status,now(),r["id"]))
+            current=c.execute("SELECT status FROM repos WHERE id=?",(rid,)).fetchone()["status"]
+            status = "never" if current == "queued" else current
+        c.execute("UPDATE repos SET status=?,updated_at=? WHERE id=?",(status,now(),rid))
     c.commit(); c.close()
 
 def scheduler_status():
     c=db(); interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL)
-    rows=c.execute("SELECT id,full_name,last_checked_at FROM repos WHERE monitoring=1").fetchall(); c.close()
+    rows=c.execute("SELECT id,full_name,last_checked_at,created_at FROM repos WHERE monitoring=1").fetchall(); c.close()
     now_dt=datetime.now(timezone.utc); next_at=None; due_count=0
     from datetime import timedelta
     for r in rows:
-        due_at=now_dt
-        if r["last_checked_at"]:
-            try: due_at=datetime.fromisoformat(r["last_checked_at"])+timedelta(minutes=interval)
-            except ValueError: pass
-        if due_at<=now_dt: due_count+=1
-        if next_at is None or due_at<next_at: next_at=due_at
+        last_dt = parse_iso_utc(r["last_checked_at"])
+        if last_dt:
+            due_at = last_dt + timedelta(minutes=interval)
+        else:
+            created_dt = parse_iso_utc(r["created_at"])
+            if created_dt and (now_dt - created_dt).total_seconds() < interval * 60:
+                due_at = created_dt + timedelta(minutes=interval)
+            else:
+                due_at = now_dt
+        if due_at <= now_dt:
+            due_count += 1
+        if next_at is None or due_at < next_at:
+            next_at = due_at
     seconds=max(0,int((next_at-now_dt).total_seconds())) if next_at else None
     return {"interval_minutes":interval,"monitoring_repos":len(rows),"due_now":due_count,
             "next_check_at":next_at.isoformat() if next_at else None,"seconds_until_next":seconds}
@@ -795,19 +878,20 @@ async def scheduler():
     await asyncio.sleep(5)
     while True:
         try:
-            c=db(); rows=c.execute("SELECT * FROM repos WHERE monitoring=1").fetchall(); interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL); c.close()
+            c=db(); rows=c.execute("SELECT * FROM repos WHERE monitoring=1").fetchall()
+            interval=get_int(c,"check_interval_minutes",DEFAULT_INTERVAL); c.close()
             t=datetime.now(timezone.utc)
             for r in rows:
-                due=True
-                if r["last_checked_at"]:
-                    try: due=(t-datetime.fromisoformat(r["last_checked_at"])).total_seconds()>=interval*60
-                    except ValueError: pass
+                last_dt = parse_iso_utc(r["last_checked_at"])
+                due = (last_dt is None) or ((t - last_dt).total_seconds() >= interval * 60)
                 if due:
                     try: await check_repo(r["id"])
-                    except Exception: pass
+                    except Exception as e:
+                        print(f"[scheduler] check error for {r.get('full_name')}: {e}", flush=True)
             await refresh_version_statuses()
             await refresh_repo_statuses()
-        except Exception: pass
+        except Exception as e:
+            print(f"[scheduler] loop error: {e}", flush=True)
         await asyncio.sleep(60)
 
 class RepoIn(BaseModel): url:str; archive_history:bool=False
@@ -845,6 +929,8 @@ async def startup():
     except Exception as e: print(f"[startup] queue history sync failed: {e}",flush=True)
     try: print(f"[startup] {reconcile_missing_files()} missing file(s) marked as deleted",flush=True)
     except Exception as e: print(f"[startup] could not check for missing files: {e}",flush=True)
+    await refresh_version_statuses()
+    await refresh_repo_statuses()
     worker_tasks=[asyncio.create_task(worker()) for _ in range(WORKERS)]
     background_task=asyncio.create_task(scheduler())
 async def shutdown():
@@ -1067,6 +1153,8 @@ async def recover_queue():
     c.commit(); c.close()
     dead=sum(1 for t in worker_tasks if t.done())
     worker_state["last_error"]=None; worker_state["last_error_at"]=None
+    await refresh_version_statuses()
+    await refresh_repo_statuses()
     await ensure_workers()
     return {"ok":True,"requeued_stale":len(orphaned),"completed_inconsistent":fixed,"workers_restarted":dead}
 
@@ -1108,6 +1196,7 @@ async def queue(page:int=1,page_size:int=25,search:str="",sort:str="id-desc",vie
               "eta-asc":"COALESCE(f.eta_seconds,999999999) ASC","eta-desc":"COALESCE(f.eta_seconds,999999999) DESC"}
     order=sort_map.get(sort,"q.id DESC")+", q.id DESC"; clauses=[]; params=[]
     if view=="active": clauses.append("q.status<>'done' AND f.status NOT IN ('complete','deleted')")
+    elif view=="failed": clauses.append("(q.status='failed' OR f.status='failed')")
     if search:
         clauses.append("lower(r.full_name || ' ' || f.name || ' ' || f.category || ' ' || q.status || ' ' || f.status) LIKE ?"); params.append(f"%{search}%")
     where=("WHERE "+" AND ".join(clauses)+" ") if clauses else ""
@@ -1231,24 +1320,28 @@ def archive_entry(x):
     if x.is_dir():
         size=0
         try:
-            for p in x.rglob("*"):
-                if p.is_file() and not p.is_symlink():
-                    try: size+=p.stat().st_size
-                    except OSError: pass
+            with os.scandir(x) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        try: size+=entry.stat(follow_symlinks=False).st_size
+                        except OSError: pass
         except OSError:
             pass
     else:
-        try: size=x.stat().st_size
+        try: size=x.stat(follow_symlinks=False).st_size
         except OSError: size=0
     created_at=None
     try:
-        st=x.stat(); ts=getattr(st,"st_birthtime",None) or min(st.st_mtime,st.st_ctime)
+        st=x.stat(follow_symlinks=False); ts=getattr(st,"st_birthtime",None) or min(st.st_mtime,st.st_ctime)
         created_at=datetime.fromtimestamp(ts,tz=timezone.utc).isoformat()
     except (OSError,ValueError,OverflowError): pass
     return {"name":x.name,"path":str(x.relative_to(DATA_DIR)),"directory":x.is_dir(),"size":size,"created_at":created_at}
 
 def archive_target(path):
-    target=(DATA_DIR/path).resolve()
+    path_str=str(path or "").strip()
+    if not path_str or path_str in (".","repos"):
+        return REPOS_DIR.resolve()
+    target=(DATA_DIR/path_str).resolve()
     try:
         target.relative_to(REPOS_DIR.resolve())
     except ValueError:
@@ -1263,7 +1356,7 @@ async def archive_tree():
     return {"root":"repos","entries":entries}
 
 @app.get("/api/archive/list")
-async def archive_list(path:str=""):
+async def archive_list(path:str="repos"):
     target=archive_target(path)
     if not target.is_dir(): raise HTTPException(400,"Invalid archive path")
     entries=[archive_entry(x) for x in target.iterdir()]
@@ -1389,6 +1482,11 @@ async def webhook(request:Request):
         sig=request.headers.get("x-hub-signature-256","")
         expected="sha256="+hmac.new(WEBHOOK_SECRET.encode(),body,hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig,expected): raise HTTPException(401,"Invalid webhook signature")
+    elif ADMIN_TOKEN:
+        auth=request.headers.get("authorization","")
+        supplied=auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-archive-token","").strip()
+        if not supplied or not hmac.compare_digest(supplied,ADMIN_TOKEN):
+            raise HTTPException(401,"Webhook secret or admin token required")
     try: payload=json.loads(body)
     except Exception: raise HTTPException(400,"Invalid JSON")
     event=request.headers.get("x-github-event","").lower()

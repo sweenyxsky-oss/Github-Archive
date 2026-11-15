@@ -132,6 +132,17 @@
       margin: 16px 0;
       pointer-events: auto;
     }
+    .stat-clickable {
+      cursor: pointer;
+      transition: transform 0.15s ease, border-color 0.15s ease;
+    }
+    .stat-clickable:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .stat b.stat-failed {
+      color: var(--failed);
+    }
 
     .grid {
       display: grid;
